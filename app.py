@@ -998,33 +998,48 @@ def main():
                 return (label, custom_start or today, custom_end or today)
 
         def resolve_comparison(primary_label, primary_start, primary_end, compare_name):
-            """Return (label, start, end) for the comparison period."""
+            """Return (label, start, end) for the comparison period — exact apples-to-apples."""
             if compare_name == "None":
                 return None
+
             delta = primary_end - primary_start
+
             if compare_name == "Same Period Last Year":
                 try:
                     cs = primary_start.replace(year=primary_start.year - 1)
                     ce = primary_end.replace(year=primary_end.year - 1)
                 except ValueError:
+                    # Feb 29 edge case
                     cs = primary_start - timedelta(days=365)
-                    ce = primary_end - timedelta(days=365)
-                # Build a clean label
+                    ce = primary_end   - timedelta(days=365)
+
+                # Always derive label from the ACTUAL comparison dates, not the primary label
+                # so "Feb 2026" → "Feb 2025", "Q1 2026" → "Q1 2025", "2026 YTD" → "2025 YTD"
                 if "YTD" in primary_label:
-                    lbl = f"{primary_start.year - 1} YTD"
+                    lbl = primary_label.replace(str(primary_start.year), str(cs.year))
                 elif primary_label.startswith("Q"):
+                    # e.g. "Q1 2026" → "Q1 2025"
                     parts = primary_label.split()
-                    lbl = f"{parts[0]} {int(parts[1]) - 1}"
+                    lbl = f"{parts[0]} {cs.year}"
+                elif "Last 12 Months" in primary_label:
+                    lbl = "Prior 12 Months"
+                elif "Last 30 Days" in primary_label:
+                    lbl = "Prior 30 Days"
+                elif "Last 60 Days" in primary_label:
+                    lbl = "Prior 60 Days"
+                elif "Last 90 Days" in primary_label:
+                    lbl = "Prior 90 Days"
                 else:
-                    try:
-                        lbl = str(int(primary_label.split()[0]) - 1)
-                    except:
-                        lbl = f"Prior Year"
+                    # Month name e.g. "Feb 2026" → "Feb 2025"
+                    # or full year "2026" → "2025"
+                    lbl = primary_label.replace(str(primary_start.year), str(cs.year))
+
                 return (lbl, cs, ce)
+
             elif compare_name == "Previous Period":
                 ce = primary_start - timedelta(days=1)
                 cs = ce - delta
-                lbl = f"Prev {primary_label}"
+                lbl = f"{cs.strftime('%b %d')} – {ce.strftime('%b %d, %Y')}"
                 return (lbl, cs, ce)
 
         # Resolve the periods — primary + comparison only, no auto-inserted 3rd period
@@ -1045,6 +1060,15 @@ def main():
         st.caption("**Resolved periods:**")
         for p in periods:
             st.caption(f"• **{p['label']}**: {p['start'].strftime('%b %d, %Y')} → {p['end'].strftime('%b %d, %Y')}")
+
+        # Apples-to-apples confirmation
+        if len(periods) == 2 and compare_to == "Same Period Last Year":
+            p_days  = (periods[1]["end"] - periods[1]["start"]).days + 1
+            c_days  = (periods[0]["end"] - periods[0]["start"]).days + 1
+            if p_days == c_days:
+                st.caption(f"✅ Exact match: both periods are **{p_days} days**")
+            else:
+                st.caption(f"⚠️ Period lengths differ: {p_days}d vs {c_days}d (e.g. Feb vs Feb in leap year)")
 
         st.divider()
 
