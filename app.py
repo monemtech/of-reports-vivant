@@ -1217,8 +1217,10 @@ def main():
         all_reps = ['All'] + sorted([r for r in df['Sales Rep'].unique() if r])
         selected_rep = st.selectbox("Sales Rep", all_reps)
     with col2:
-        all_tiers = ['All'] + sorted([t for t in df['Tier'].unique() if t])
-        selected_tier = st.selectbox("Tier", all_tiers)
+        assigned_tiers = sorted([t for t in df['Tier'].unique() if t])
+        has_untiered   = df['Tier'].eq('').any() or df['Tier'].isna().any()
+        tier_options   = ['All'] + assigned_tiers + (['(No Tier)'] if has_untiered else [])
+        selected_tier  = st.selectbox("Tier", tier_options)
     with col3:
         min_ytd = st.number_input("Min YTD Sales ($)", min_value=0, value=0, step=500)
     with col4:
@@ -1227,7 +1229,10 @@ def main():
     # Apply filters
     filtered_df = df.copy()
     if selected_rep  != 'All': filtered_df = filtered_df[filtered_df['Sales Rep'] == selected_rep]
-    if selected_tier != 'All': filtered_df = filtered_df[filtered_df['Tier'] == selected_tier]
+    if selected_tier == '(No Tier)':
+        filtered_df = filtered_df[filtered_df['Tier'].eq('') | filtered_df['Tier'].isna()]
+    elif selected_tier != 'All':
+        filtered_df = filtered_df[filtered_df['Tier'] == selected_tier]
     if min_ytd > 0:            filtered_df = filtered_df[filtered_df['YTD Sales'] >= min_ytd]
 
     # Apply sort
@@ -1406,6 +1411,13 @@ def main():
                                 delta=f"-{dropped/total*100:.1f}%" if total else "0%",
                                 delta_color="inverse")
             with c4: st.metric("Unique Companies",    f"{audit.get('unique_companies', 0):,}")
+
+            # Untiered accounts callout
+            if df is not None:
+                untiered = df['Tier'].eq('').sum() + df['Tier'].isna().sum()
+                if untiered:
+                    st.warning(f"⚠️ **{untiered} accounts** have no HubSpot tier assigned. "
+                               f"Use the **Tier → (No Tier)** filter to view them.")
 
             st.divider()
 
