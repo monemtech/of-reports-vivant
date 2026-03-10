@@ -621,37 +621,29 @@ def fetch_hubspot_company_data(api_key: str, tier_property: str = "commission_ti
 def build_report_dataframe(company_data: dict, hubspot_tiers: dict, periods: list,
                            company_owners: dict = None, owners_lookup: dict = None) -> pd.DataFrame:
     """
-    Build the management report DataFrame with fixed semantic column names.
-
-    Always outputs:
-        Account | YTD Sales | Prior Year Sales | $ Change | % Change | Tier | Sales Rep
-
-    The 'periods' list drives what data fills each column:
-      - Last period  = primary (YTD Sales)
-      - Second-to-last = comparison (Prior Year Sales)
-    Column names are intentionally static so reports are always readable
-    regardless of the current year.
+    Build the management report DataFrame.
+    Column names are derived directly from the selected period labels so
+    'YTD Sales' / 'Prior Year Sales' always reflect what was actually selected.
     """
     rows = []
 
-    # Determine which period label maps to which semantic column
-    # periods always has 2-3 entries; last = primary, second-to-last = comparison
-    labels = [p["label"] for p in periods]
-    primary_label     = labels[-1]   # e.g. "2026 YTD"
-    comparison_label  = labels[-2] if len(labels) >= 2 else None
+    labels           = [p["label"] for p in periods]
+    primary_label    = labels[-1]
+    comparison_label = labels[-2] if len(labels) >= 2 else None
+
+    # Column names shown in the table — derived from real period labels
+    primary_col    = primary_label
+    comparison_col = comparison_label if comparison_label else "Comparison"
 
     for company, data in company_data.items():
-        ytd_sales  = data.get(primary_label, 0)
-        prior_sales = data.get(comparison_label, 0) if comparison_label else 0
+        primary_sales    = data.get(primary_label, 0)
+        comparison_sales = data.get(comparison_label, 0) if comparison_label else 0
 
-        # Skip accounts with zero activity in both periods
-        if ytd_sales == 0 and prior_sales == 0:
+        if primary_sales == 0 and comparison_sales == 0:
             continue
 
-        # Tier from HubSpot
         tier = hubspot_tiers.get(company.upper(), '')
 
-        # Sales rep: Cin7 first, HubSpot owner fallback
         cin7_rep = data.get('rep', '')
         if cin7_rep:
             rep = cin7_rep
@@ -661,32 +653,30 @@ def build_report_dataframe(company_data: dict, hubspot_tiers: dict, periods: lis
         else:
             rep = ''
 
-        # Change calculations (YTD vs Prior)
-        if prior_sales > 0:
-            change_pct = ((ytd_sales - prior_sales) / prior_sales) * 100
-        elif ytd_sales > 0:
+        if comparison_sales > 0:
+            change_pct = ((primary_sales - comparison_sales) / comparison_sales) * 100
+        elif primary_sales > 0:
             change_pct = 100.0
         else:
             change_pct = 0.0
-        change_dollars = ytd_sales - prior_sales
+        change_dollars = primary_sales - comparison_sales
 
         rows.append({
-            'Account':            company,
-            'YTD Sales':          ytd_sales,
-            'Prior Year Sales':   prior_sales,
-            '$ Change':           change_dollars,
-            '% Change':           change_pct,
-            'Tier':               tier,
-            'Sales Rep':          rep,
-            # Keep these for internal filtering/sorting, hidden from main table
-            '_order_count':       data.get('order_count', 0),
-            '_primary_label':     primary_label,
-            '_comparison_label':  comparison_label or '',
+            'Account':          company,
+            primary_col:        primary_sales,
+            comparison_col:     comparison_sales,
+            '$ Change':         change_dollars,
+            '% Change':         change_pct,
+            'Tier':             tier,
+            'Sales Rep':        rep,
+            '_order_count':     data.get('order_count', 0),
+            '_primary_col':     primary_col,
+            '_comparison_col':  comparison_col,
         })
 
     df = pd.DataFrame(rows)
     if not df.empty:
-        df = df.sort_values('YTD Sales', ascending=False).reset_index(drop=True)
+        df = df.sort_values(primary_col, ascending=False).reset_index(drop=True)
     return df
 
 # =============================================================================
@@ -764,84 +754,73 @@ def inject_css():
 # CHART FUNCTIONS
 # =============================================================================
 def create_yoy_chart(df: pd.DataFrame, periods: list):
-    """Top 15 accounts — YTD vs Prior Year bar chart."""
+    """Top 15 accounts — primary vs comparison bar chart."""
     import plotly.graph_objects as go
 
-    top = df.nlargest(15, 'YTD Sales')
-    primary_label    = periods[-1]["label"] if periods else "YTD"
-    comparison_label = periods[-2]["label"] if len(periods) >= 2 else "Prior Year"
+    primary_col    = df['_primary_col'].iloc[0]    if '_primary_col'    in df.columns else 'Sales'
+    comparison_col = df['_comparison_col'].iloc[0] if '_comparison_col' in df.columns else 'Comparison'
 
+    top = df.nlargest(15, primary_col)
     fig = go.Figure()
-    fig.add_trace(go.Bar(name=f"Prior Year ({comparison_label})",
-                         x=top['Account'], y=top['Prior Year Sales'], marker_color='#3498db'))
-    fig.add_trace(go.Bar(name=f"YTD ({primary_label})",
-                         x=top['Account'], y=top['YTD Sales'], marker_color='#00d4aa'))
-
+    if comparison_col in df.columns:
+        fig.add_trace(go.Bar(name=comparison_col, x=top['Account'],
+                             y=top[comparison_col], marker_color='#3498db'))
+    fig.add_trace(go.Bar(name=primary_col, x=top['Account'],
+                         y=top[primary_col], marker_color='#00d4aa'))
     fig.update_layout(
-        title='Top 15 Accounts — YTD vs Prior Year',
-        barmode='group',
-        xaxis_tickangle=-45,
-        height=500,
+        title=f'Top 15 Accounts — {primary_col} vs {comparison_col}',
+        barmode='group', xaxis_tickangle=-45, height=500,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
     return fig
 
 def create_rep_performance_chart(df: pd.DataFrame):
-    """Sales rep YTD performance chart."""
+    """Sales rep performance chart — primary period."""
     import plotly.express as px
-
+    primary_col = df['_primary_col'].iloc[0] if '_primary_col' in df.columns else 'Sales'
     rep_data = df.groupby('Sales Rep').agg(
-        YTD_Sales=('YTD Sales', 'sum'),
-        Accounts=('Account', 'count')
+        Sales=(primary_col, 'sum'), Accounts=('Account', 'count')
     ).reset_index()
-    rep_data = rep_data[rep_data['Sales Rep'] != ''].sort_values('YTD_Sales', ascending=True)
-
-    fig = px.bar(rep_data, y='Sales Rep', x='YTD_Sales', orientation='h',
-                 title='YTD Sales by Rep', color='YTD_Sales',
+    rep_data = rep_data[rep_data['Sales Rep'] != ''].sort_values('Sales', ascending=True)
+    fig = px.bar(rep_data, y='Sales Rep', x='Sales', orientation='h',
+                 title=f'{primary_col} by Rep', color='Sales',
                  color_continuous_scale='Blues',
-                 labels={'YTD_Sales': 'YTD Sales ($)'})
+                 labels={'Sales': f'{primary_col} ($)'})
     fig.update_layout(height=400, showlegend=False)
     return fig
 
 def create_tier_breakdown_chart(df: pd.DataFrame):
-    """Tier breakdown by YTD sales."""
+    """Tier breakdown by primary period sales."""
     import plotly.express as px
-
-    tier_data = df.groupby('Tier').agg(YTD_Sales=('YTD Sales', 'sum')).reset_index()
+    primary_col = df['_primary_col'].iloc[0] if '_primary_col' in df.columns else 'Sales'
+    tier_data = df.groupby('Tier').agg(Sales=(primary_col, 'sum')).reset_index()
     tier_data = tier_data[tier_data['Tier'] != '']
     if tier_data.empty:
         return None
-
-    fig = px.pie(tier_data, values='YTD_Sales', names='Tier',
-                 title='YTD Sales by Tier',
+    fig = px.pie(tier_data, values='Sales', names='Tier',
+                 title=f'{primary_col} by Tier',
                  color_discrete_sequence=px.colors.qualitative.Set2)
     fig.update_layout(height=400)
     return fig
 
 def create_growth_scatter(df: pd.DataFrame, periods: list):
-    """YTD vs Prior Year growth scatter."""
+    """Primary vs comparison growth scatter."""
     import plotly.express as px
-
-    primary_label    = periods[-1]["label"] if periods else "YTD"
-    comparison_label = periods[-2]["label"] if len(periods) >= 2 else "Prior Year"
-
-    plot_df = df[(df['YTD Sales'] > 0) | (df['Prior Year Sales'] > 0)].copy()
+    primary_col    = df['_primary_col'].iloc[0]    if '_primary_col'    in df.columns else 'Sales'
+    comparison_col = df['_comparison_col'].iloc[0] if '_comparison_col' in df.columns else 'Comparison'
+    if comparison_col not in df.columns:
+        return None
+    plot_df = df[(df[primary_col] > 0) | (df[comparison_col] > 0)].copy()
     if plot_df.empty:
         return None
-
     fig = px.scatter(
-        plot_df,
-        x='Prior Year Sales', y='YTD Sales',
-        size='YTD Sales',
-        color='Tier' if plot_df['Tier'].any() else None,
-        hover_name='Account',
-        hover_data={'$ Change': True, '% Change': True},
-        title=f'YTD vs Prior Year — Growth Quadrant',
-        labels={'Prior Year Sales': f'Prior Year ({comparison_label}) ($)',
-                'YTD Sales': f'YTD ({primary_label}) ($)'}
+        plot_df, x=comparison_col, y=primary_col,
+        size=primary_col, color='Tier' if plot_df['Tier'].any() else None,
+        hover_name='Account', hover_data={'$ Change': True, '% Change': True},
+        title=f'{primary_col} vs {comparison_col}',
+        labels={comparison_col: f'{comparison_col} ($)', primary_col: f'{primary_col} ($)'}
     )
-
-    max_val = max(plot_df['Prior Year Sales'].max(), plot_df['YTD Sales'].max())
+    max_val = max(plot_df[comparison_col].max(), plot_df[primary_col].max())
     fig.add_shape(type='line', x0=0, y0=0, x1=max_val, y1=max_val,
                   line=dict(color='gray', dash='dash'))
     fig.update_layout(height=500)
@@ -1187,8 +1166,9 @@ def main():
     # =========================================================================
     df = st.session_state.report_data
 
-    # Guard: if cached df has old column structure, clear it
-    REQUIRED_COLS = {'Account', 'YTD Sales', 'Prior Year Sales', '$ Change', '% Change', 'Tier', 'Sales Rep'}
+    # Guard: clear stale cache if it's missing required structural columns
+    REQUIRED_COLS = {'Account', '$ Change', '% Change', 'Tier', 'Sales Rep',
+                     '_primary_col', '_comparison_col'}
     if df is not None and not REQUIRED_COLS.issubset(set(df.columns)):
         st.session_state.report_data = None
         df = None
@@ -1209,20 +1189,14 @@ def main():
         """)
         return
     
+    # Derive actual column names from the dataframe
+    primary_col    = df['_primary_col'].iloc[0]    if '_primary_col'    in df.columns else 'Sales'
+    comparison_col = df['_comparison_col'].iloc[0] if '_comparison_col' in df.columns else 'Comparison'
+
     # -------------------------------------------------------------------------
     # FILTERS
     # -------------------------------------------------------------------------
     periods = st.session_state.get('periods', [])
-    primary_label    = periods[-1]["label"] if periods else "YTD"
-    comparison_label = periods[-2]["label"] if len(periods) >= 2 else "Prior Year"
-
-    # Period context banner
-    if periods:
-        p = periods[-1]; c = periods[-2] if len(periods) >= 2 else None
-        banner = f"**YTD Sales** = {p['start'].strftime('%b %d, %Y')} → {p['end'].strftime('%b %d, %Y')}"
-        if c:
-            banner += f"  |  **Prior Year Sales** = {c['start'].strftime('%b %d, %Y')} → {c['end'].strftime('%b %d, %Y')}"
-        st.caption(banner)
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
@@ -1234,9 +1208,12 @@ def main():
         tier_options   = ['All'] + assigned_tiers + (['(No Tier)'] if has_untiered else [])
         selected_tier  = st.selectbox("Tier", tier_options)
     with col3:
-        min_ytd = st.number_input("Min YTD Sales ($)", min_value=0, value=0, step=500)
+        min_ytd = st.number_input(f"Min {primary_col} ($)", min_value=0, value=0, step=500)
     with col4:
-        sort_by = st.selectbox("Sort By", ["YTD Sales ↓", "Prior Year Sales ↓", "% Change ↓", "% Change ↑", "Account A→Z"])
+        sort_by = st.selectbox("Sort By", [
+            f"{primary_col} ↓", f"{comparison_col} ↓",
+            "% Change ↓", "% Change ↑", "Account A→Z"
+        ])
 
     # Apply filters
     filtered_df = df.copy()
@@ -1245,17 +1222,16 @@ def main():
         filtered_df = filtered_df[filtered_df['Tier'].eq('') | filtered_df['Tier'].isna()]
     elif selected_tier != 'All':
         filtered_df = filtered_df[filtered_df['Tier'] == selected_tier]
-    if min_ytd > 0:            filtered_df = filtered_df[filtered_df['YTD Sales'] >= min_ytd]
+    if min_ytd > 0: filtered_df = filtered_df[filtered_df[primary_col] >= min_ytd]
 
-    # Apply sort
     sort_map = {
-        "YTD Sales ↓":        ("YTD Sales",        False),
-        "Prior Year Sales ↓": ("Prior Year Sales",  False),
-        "% Change ↓":         ("% Change",          False),
-        "% Change ↑":         ("% Change",          True),
-        "Account A→Z":        ("Account",           True),
+        f"{primary_col} ↓":    (primary_col,    False),
+        f"{comparison_col} ↓": (comparison_col, False),
+        "% Change ↓":          ("% Change",     False),
+        "% Change ↑":          ("% Change",     True),
+        "Account A→Z":         ("Account",      True),
     }
-    scol, sasc = sort_map[sort_by]
+    scol, sasc = sort_map.get(sort_by, (primary_col, False))
     if scol in filtered_df.columns:
         filtered_df = filtered_df.sort_values(scol, ascending=sasc).reset_index(drop=True)
 
@@ -1264,21 +1240,21 @@ def main():
     # -------------------------------------------------------------------------
     st.divider()
 
-    total_ytd   = filtered_df['YTD Sales'].sum()
-    total_prior = filtered_df['Prior Year Sales'].sum()
-    total_chg_d = filtered_df['$ Change'].sum()
-    total_chg_p = ((total_ytd - total_prior) / total_prior * 100) if total_prior > 0 else 0
-    growing     = (filtered_df['% Change'] > 0).sum()
-    declining   = (filtered_df['% Change'] < 0).sum()
+    total_primary    = filtered_df[primary_col].sum()
+    total_comparison = filtered_df[comparison_col].sum() if comparison_col in filtered_df.columns else 0
+    total_chg_d      = filtered_df['$ Change'].sum()
+    total_chg_p      = ((total_primary - total_comparison) / total_comparison * 100) \
+                        if total_comparison > 0 else 0
+    growing          = (filtered_df['% Change'] > 0).sum()
+    declining        = (filtered_df['% Change'] < 0).sum()
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     with c1: st.metric("Accounts",        f"{len(filtered_df):,}")
-    with c2: st.metric("YTD Sales",        f"${total_ytd:,.0f}")
-    with c3: st.metric("Prior Year Sales", f"${total_prior:,.0f}")
-    with c4: st.metric("$ Change",         f"${total_chg_d:+,.0f}")
-    with c5: st.metric("% Change",         f"{total_chg_p:+.1f}%")
-    with c6:
-        st.metric("Growing / Declining", f"↑{growing}  ↓{declining}")
+    with c2: st.metric(primary_col,       f"${total_primary:,.0f}")
+    with c3: st.metric(comparison_col,    f"${total_comparison:,.0f}")
+    with c4: st.metric("$ Change",        f"${total_chg_d:+,.0f}")
+    with c5: st.metric("% Change",        f"{total_chg_p:+.1f}%")
+    with c6: st.metric("↑ Growing  ↓ Declining", f"{growing}  /  {declining}")
 
     # -------------------------------------------------------------------------
     # TABS: Table | Charts | Export
@@ -1290,11 +1266,9 @@ def main():
     # TAB 1 — Account Report (exactly the 7 columns)
     # ------------------------------------------------------------------
     with tab1:
-
         # ── Date range header ─────────────────────────────────────────
         if len(periods) == 2:
-            pri = periods[1]
-            cmp = periods[0]
+            pri = periods[1]; cmp = periods[0]
             st.markdown(
                 f"**{pri['label']}** &nbsp;·&nbsp; "
                 f"{pri['start'].strftime('%b %d, %Y')} — {pri['end'].strftime('%b %d, %Y')}"
@@ -1309,18 +1283,19 @@ def main():
                 f"**{pri['label']}** &nbsp;·&nbsp; "
                 f"{pri['start'].strftime('%b %d, %Y')} — {pri['end'].strftime('%b %d, %Y')}"
             )
-
         st.caption(f"{len(filtered_df)} accounts")
 
         # ── Build display rows ────────────────────────────────────────
-        display_df = filtered_df[['Account', 'YTD Sales', 'Prior Year Sales',
-                                   '$ Change', '% Change', 'Tier', 'Sales Rep']].copy()
+        display_cols = ['Account', primary_col, comparison_col, '$ Change', '% Change', 'Tier', 'Sales Rep']
+        display_cols = [c for c in display_cols if c in filtered_df.columns]
+        display_df   = filtered_df[display_cols].copy()
 
-        display_df['YTD Sales']        = display_df['YTD Sales'].apply(lambda x: f"${x:,.2f}")
-        display_df['Prior Year Sales'] = display_df['Prior Year Sales'].apply(lambda x: f"${x:,.2f}")
-        display_df['$ Change']         = display_df['$ Change'].apply(
+        display_df[primary_col]    = display_df[primary_col].apply(lambda x: f"${x:,.2f}")
+        if comparison_col in display_df.columns:
+            display_df[comparison_col] = display_df[comparison_col].apply(lambda x: f"${x:,.2f}")
+        display_df['$ Change']     = display_df['$ Change'].apply(
             lambda x: f"+${x:,.2f}" if x >= 0 else f"-${abs(x):,.2f}")
-        display_df['% Change']         = display_df['% Change'].apply(lambda x: f"{x:+.1f}%")
+        display_df['% Change']     = display_df['% Change'].apply(lambda x: f"{x:+.1f}%")
 
         st.dataframe(display_df, use_container_width=True, hide_index=True,
                      height=min(600, (len(display_df) + 1) * 35 + 38))
@@ -1353,8 +1328,9 @@ def main():
     # ------------------------------------------------------------------
     with tab3:
         st.subheader("📤 Export Report")
-        export_df = filtered_df[['Account', 'YTD Sales', 'Prior Year Sales',
-                                  '$ Change', '% Change', 'Tier', 'Sales Rep']].copy()
+        export_cols = ['Account', primary_col, comparison_col, '$ Change', '% Change', 'Tier', 'Sales Rep']
+        export_cols = [c for c in export_cols if c in filtered_df.columns]
+        export_df   = filtered_df[export_cols].copy()
 
         col1, col2 = st.columns(2)
         with col1:
@@ -1402,7 +1378,7 @@ def main():
             with c4: st.metric("Unique Companies",    f"{audit.get('unique_companies', 0):,}")
 
             # Untiered accounts callout
-            if df is not None:
+            if df is not None and 'Tier' in df.columns:
                 untiered = df['Tier'].eq('').sum() + df['Tier'].isna().sum()
                 if untiered:
                     st.warning(f"⚠️ **{untiered} accounts** have no HubSpot tier assigned. "
