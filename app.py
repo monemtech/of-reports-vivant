@@ -40,6 +40,34 @@ CURRENT_YEAR = datetime.now().year
 ANALYSIS_YEARS = [CURRENT_YEAR - 2, CURRENT_YEAR - 1, CURRENT_YEAR]  # default fallback
 
 # =============================================================================
+# CONFIG PERSISTENCE
+# =============================================================================
+def load_config() -> dict:
+    """Load saved config (date prefs) from disk."""
+    try:
+        if CONFIG_FILE.exists():
+            return json.loads(CONFIG_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+def save_config(data: dict):
+    """Save config (date prefs) to disk."""
+    try:
+        existing = load_config()
+        existing.update(data)
+        CONFIG_FILE.write_text(json.dumps(existing))
+    except Exception:
+        pass
+
+def get_secret(key: str, default: str = "") -> str:
+    """Read from Streamlit secrets if available, else return default."""
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+# =============================================================================
 # SESSION STATE
 # =============================================================================
 if 'report_data' not in st.session_state:
@@ -48,6 +76,8 @@ if 'cin7_orders_cache' not in st.session_state:
     st.session_state.cin7_orders_cache = None
 if 'hubspot_companies_cache' not in st.session_state:
     st.session_state.hubspot_companies_cache = None
+if 'config_loaded' not in st.session_state:
+    st.session_state.config_loaded = load_config()
 
 # =============================================================================
 # CIN7 API FUNCTIONS
@@ -606,11 +636,11 @@ def main():
     # =========================================================================
     with st.sidebar:
         st.header("⚙️ Data Sources")
-        
-        # Cin7 Credentials
+
+        # Cin7 Credentials — pre-filled from Streamlit Secrets if set
         st.subheader("📦 Cin7 API")
-        cin7_user = st.text_input("Username", key="cin7_user")
-        cin7_key = st.text_input("API Key", type="password", key="cin7_key")
+        cin7_user = st.text_input("Username", value=get_secret("CIN7_USERNAME"), key="cin7_user")
+        cin7_key  = st.text_input("API Key",  value=get_secret("CIN7_API_KEY"), type="password", key="cin7_key")
         
         if cin7_user and cin7_key:
             ok, msg = test_cin7_connection(cin7_user, cin7_key)
@@ -621,10 +651,10 @@ def main():
         
         st.divider()
         
-        # HubSpot Credentials
+        # HubSpot Credentials — pre-filled from Streamlit Secrets if set
         st.subheader("🟠 HubSpot API")
-        hubspot_key = st.text_input("Private App Token", type="password", key="hubspot_key")
-        tier_property = st.text_input("Tier Property Name", value="commission_tier", key="tier_prop",
+        hubspot_key   = st.text_input("Private App Token", value=get_secret("HUBSPOT_API_KEY"), type="password", key="hubspot_key")
+        tier_property = st.text_input("Tier Property Name", value=get_secret("HUBSPOT_TIER_PROPERTY", "commission_tier"), key="tier_prop",
                                        help="The internal name of your Tier property in HubSpot")
         
         if hubspot_key:
@@ -663,12 +693,20 @@ def main():
             "Custom Range",
         ]
 
+        # Load last used preferences
+        _cfg = st.session_state.config_loaded
+        _saved_period  = _cfg.get("last_period", "Year to Date")
+        _saved_compare = _cfg.get("last_compare", "Same Period Last Year")
+        _saved_p_idx   = PERIOD_OPTIONS.index(_saved_period) if _saved_period in PERIOD_OPTIONS else 4
+        _compare_opts  = ["Same Period Last Year", "Previous Period", "None"]
+        _saved_c_idx   = _compare_opts.index(_saved_compare) if _saved_compare in _compare_opts else 0
+
         selected_period = st.selectbox("Primary Period", PERIOD_OPTIONS,
-                                        index=4, key="primary_period")
+                                        index=_saved_p_idx, key="primary_period")
 
         compare_options = ["Same Period Last Year", "Previous Period", "None"]
         compare_to = st.selectbox("Compare Against", compare_options,
-                                   index=0, key="compare_to")
+                                   index=_saved_c_idx, key="compare_to")
 
         # Custom range inputs — only shown when needed
         custom_start, custom_end = None, None
@@ -801,6 +839,12 @@ def main():
                      use_container_width=True, disabled=not can_generate):
             with st.spinner("Building report..."):
                 progress_text = st.empty()
+
+                # Save period preferences for next session
+                save_config({
+                    "last_period":  selected_period,
+                    "last_compare": compare_to,
+                })
 
                 # Store period config in session state
                 st.session_state.periods = periods
