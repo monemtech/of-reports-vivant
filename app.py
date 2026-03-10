@@ -636,33 +636,161 @@ def main():
         
         st.divider()
 
-        # Date Range Configuration
-        st.subheader("📅 Date Ranges")
-        st.caption("Define up to 3 periods to compare (e.g. full years or custom ranges)")
+        # ── REPORT PERIOD ───────────────────────────────────────────────────
+        st.subheader("📅 Report Period")
 
         today = datetime.now().date()
         cy = today.year
+        cm = today.month
 
-        with st.expander("Period 1", expanded=True):
-            p1_label = st.text_input("Label", value=str(cy - 2), key="p1_label")
-            p1_start = st.date_input("Start", value=datetime(cy - 2, 1, 1).date(), key="p1_start")
-            p1_end   = st.date_input("End",   value=datetime(cy - 2, 12, 31).date(), key="p1_end")
+        def quarter_of(month):
+            return (month - 1) // 3 + 1
 
-        with st.expander("Period 2", expanded=True):
-            p2_label = st.text_input("Label", value=str(cy - 1), key="p2_label")
-            p2_start = st.date_input("Start", value=datetime(cy - 1, 1, 1).date(), key="p2_start")
-            p2_end   = st.date_input("End",   value=datetime(cy - 1, 12, 31).date(), key="p2_end")
+        cq = quarter_of(cm)
 
-        with st.expander("Period 3 (YTD)", expanded=True):
-            p3_label = st.text_input("Label", value=f"{cy} YTD", key="p3_label")
-            p3_start = st.date_input("Start", value=datetime(cy, 1, 1).date(), key="p3_start")
-            p3_end   = st.date_input("End",   value=today, key="p3_end")
-
-        periods = [
-            {"label": p1_label, "start": p1_start, "end": p1_end},
-            {"label": p2_label, "start": p2_start, "end": p2_end},
-            {"label": p3_label, "start": p3_start, "end": p3_end},
+        PERIOD_OPTIONS = [
+            "This Month",
+            "Last Month",
+            "This Quarter",
+            "Last Quarter",
+            "Year to Date",
+            "Last 12 Months",
+            "This Year (Full)",
+            "Last Year (Full)",
+            "Last 30 Days",
+            "Last 60 Days",
+            "Last 90 Days",
+            "Custom Range",
         ]
+
+        selected_period = st.selectbox("Primary Period", PERIOD_OPTIONS,
+                                        index=4, key="primary_period")
+
+        compare_options = ["Same Period Last Year", "Previous Period", "None"]
+        compare_to = st.selectbox("Compare Against", compare_options,
+                                   index=0, key="compare_to")
+
+        # Custom range inputs — only shown when needed
+        custom_start, custom_end = None, None
+        if selected_period == "Custom Range":
+            custom_start = st.date_input("From", value=datetime(cy, 1, 1).date(), key="custom_start")
+            custom_end   = st.date_input("To",   value=today, key="custom_end")
+
+        def get_quarter_bounds(year, q):
+            starts = {1: (1,1), 2: (4,1), 3: (7,1), 4: (10,1)}
+            ends   = {1: (3,31), 2: (6,30), 3: (9,30), 4: (12,31)}
+            s = starts[q]; e = ends[q]
+            return datetime(year, s[0], s[1]).date(), datetime(year, e[0], e[1]).date()
+
+        def resolve_primary(period_name):
+            """Return (label, start, end) for the selected primary period."""
+            if period_name == "This Month":
+                import calendar
+                last_day = calendar.monthrange(cy, cm)[1]
+                return (
+                    datetime(cy, cm, 1).strftime("%b %Y"),
+                    datetime(cy, cm, 1).date(),
+                    min(datetime(cy, cm, last_day).date(), today)
+                )
+            elif period_name == "Last Month":
+                lm = cm - 1 if cm > 1 else 12
+                ly = cy if cm > 1 else cy - 1
+                import calendar
+                last_day = calendar.monthrange(ly, lm)[1]
+                return (
+                    datetime(ly, lm, 1).strftime("%b %Y"),
+                    datetime(ly, lm, 1).date(),
+                    datetime(ly, lm, last_day).date()
+                )
+            elif period_name == "This Quarter":
+                s, e = get_quarter_bounds(cy, cq)
+                return (f"Q{cq} {cy}", s, min(e, today))
+            elif period_name == "Last Quarter":
+                lq = cq - 1 if cq > 1 else 4
+                ly = cy if cq > 1 else cy - 1
+                s, e = get_quarter_bounds(ly, lq)
+                return (f"Q{lq} {ly}", s, e)
+            elif period_name == "Year to Date":
+                return (f"{cy} YTD", datetime(cy, 1, 1).date(), today)
+            elif period_name == "Last 12 Months":
+                return ("Last 12 Months",
+                        (today.replace(year=today.year - 1)),
+                        today)
+            elif period_name == "This Year (Full)":
+                return (str(cy), datetime(cy, 1, 1).date(), datetime(cy, 12, 31).date())
+            elif period_name == "Last Year (Full)":
+                return (str(cy - 1), datetime(cy-1, 1, 1).date(), datetime(cy-1, 12, 31).date())
+            elif period_name == "Last 30 Days":
+                return ("Last 30 Days", today - timedelta(days=30), today)
+            elif period_name == "Last 60 Days":
+                return ("Last 60 Days", today - timedelta(days=60), today)
+            elif period_name == "Last 90 Days":
+                return ("Last 90 Days", today - timedelta(days=90), today)
+            elif period_name == "Custom Range":
+                label = f"{custom_start.strftime('%b %d')} – {custom_end.strftime('%b %d, %Y')}" \
+                        if custom_start and custom_end else "Custom"
+                return (label, custom_start or today, custom_end or today)
+
+        def resolve_comparison(primary_label, primary_start, primary_end, compare_name):
+            """Return (label, start, end) for the comparison period."""
+            if compare_name == "None":
+                return None
+            delta = primary_end - primary_start
+            if compare_name == "Same Period Last Year":
+                try:
+                    cs = primary_start.replace(year=primary_start.year - 1)
+                    ce = primary_end.replace(year=primary_end.year - 1)
+                except ValueError:
+                    cs = primary_start - timedelta(days=365)
+                    ce = primary_end - timedelta(days=365)
+                # Build a clean label
+                if "YTD" in primary_label:
+                    lbl = f"{primary_start.year - 1} YTD"
+                elif primary_label.startswith("Q"):
+                    parts = primary_label.split()
+                    lbl = f"{parts[0]} {int(parts[1]) - 1}"
+                else:
+                    try:
+                        lbl = str(int(primary_label.split()[0]) - 1)
+                    except:
+                        lbl = f"Prior Year"
+                return (lbl, cs, ce)
+            elif compare_name == "Previous Period":
+                ce = primary_start - timedelta(days=1)
+                cs = ce - delta
+                lbl = f"Prev {primary_label}"
+                return (lbl, cs, ce)
+
+        # Resolve the periods
+        p_label, p_start, p_end = resolve_primary(selected_period)
+        comp = resolve_comparison(p_label, p_start, p_end, compare_to)
+
+        # Build periods list: always show prior full year + comparison + primary
+        prior_year = cy - 1
+        prior_year_end = datetime(prior_year, 12, 31).date()
+
+        if comp:
+            periods = [
+                {"label": comp[0], "start": comp[1], "end": comp[2]},
+                {"label": p_label,  "start": p_start,  "end": p_end},
+            ]
+        else:
+            periods = [
+                {"label": p_label, "start": p_start, "end": p_end},
+            ]
+
+        # Always add a 3rd full prior year column for context if we only have 2
+        if len(periods) == 2 and str(prior_year) not in [p["label"] for p in periods]:
+            periods.insert(0, {
+                "label": str(prior_year),
+                "start": datetime(prior_year, 1, 1).date(),
+                "end": prior_year_end
+            })
+
+        # Show resolved dates as a preview
+        st.caption("**Resolved periods:**")
+        for p in periods:
+            st.caption(f"• **{p['label']}**: {p['start'].strftime('%b %d, %Y')} → {p['end'].strftime('%b %d, %Y')}")
 
         st.divider()
 
