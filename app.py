@@ -894,6 +894,12 @@ def main():
     # MAIN CONTENT
     # =========================================================================
     df = st.session_state.report_data
+
+    # Guard: if cached df has old column structure, clear it
+    REQUIRED_COLS = {'Account', 'YTD Sales', 'Prior Year Sales', '$ Change', '% Change', 'Tier', 'Sales Rep'}
+    if df is not None and not REQUIRED_COLS.issubset(set(df.columns)):
+        st.session_state.report_data = None
+        df = None
     
     if df is None:
         st.info("👈 Configure your API credentials and click **Generate Report** to get started.")
@@ -953,7 +959,8 @@ def main():
         "Account A→Z":        ("Account",           True),
     }
     scol, sasc = sort_map[sort_by]
-    filtered_df = filtered_df.sort_values(scol, ascending=sasc).reset_index(drop=True)
+    if scol in filtered_df.columns:
+        filtered_df = filtered_df.sort_values(scol, ascending=sasc).reset_index(drop=True)
 
     # -------------------------------------------------------------------------
     # SUMMARY METRICS
