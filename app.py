@@ -1290,49 +1290,40 @@ def main():
     # TAB 1 — Account Report (exactly the 7 columns)
     # ------------------------------------------------------------------
     with tab1:
-        st.subheader(f"Account Performance — {len(filtered_df)} accounts")
+
+        # ── Date range header ─────────────────────────────────────────
+        if len(periods) == 2:
+            pri = periods[1]
+            cmp = periods[0]
+            st.markdown(
+                f"**{pri['label']}** &nbsp;·&nbsp; "
+                f"{pri['start'].strftime('%b %d, %Y')} — {pri['end'].strftime('%b %d, %Y')}"
+                f"&emsp;|&emsp;"
+                f"**vs. {cmp['label']}** &nbsp;·&nbsp; "
+                f"{cmp['start'].strftime('%b %d, %Y')} — {cmp['end'].strftime('%b %d, %Y')}",
+                unsafe_allow_html=True
+            )
+        elif len(periods) == 1:
+            pri = periods[0]
+            st.markdown(
+                f"**{pri['label']}** &nbsp;·&nbsp; "
+                f"{pri['start'].strftime('%b %d, %Y')} — {pri['end'].strftime('%b %d, %Y')}"
+            )
+
+        st.caption(f"{len(filtered_df)} accounts")
 
         # ── Build display rows ────────────────────────────────────────
         display_df = filtered_df[['Account', 'YTD Sales', 'Prior Year Sales',
                                    '$ Change', '% Change', 'Tier', 'Sales Rep']].copy()
 
-        # Keep raw numeric copy for totals before formatting
-        total_ytd_sum   = display_df['YTD Sales'].sum()
-        total_prior_sum = display_df['Prior Year Sales'].sum()
-        total_chg_d_sum = display_df['$ Change'].sum()
-        total_chg_p_sum = ((total_ytd_sum - total_prior_sum) / total_prior_sum * 100) \
-                           if total_prior_sum > 0 else 0.0
-
-        # Format data rows
         display_df['YTD Sales']        = display_df['YTD Sales'].apply(lambda x: f"${x:,.2f}")
         display_df['Prior Year Sales'] = display_df['Prior Year Sales'].apply(lambda x: f"${x:,.2f}")
         display_df['$ Change']         = display_df['$ Change'].apply(
             lambda x: f"+${x:,.2f}" if x >= 0 else f"-${abs(x):,.2f}")
         display_df['% Change']         = display_df['% Change'].apply(lambda x: f"{x:+.1f}%")
 
-        # ── Totals row (QuickBooks style) ─────────────────────────────
-        totals_row = pd.DataFrame([{
-            'Account':          f"TOTAL  ({len(filtered_df)} accounts)",
-            'YTD Sales':        f"${total_ytd_sum:,.2f}",
-            'Prior Year Sales': f"${total_prior_sum:,.2f}",
-            '$ Change':         f"+${total_chg_d_sum:,.2f}" if total_chg_d_sum >= 0
-                                 else f"-${abs(total_chg_d_sum):,.2f}",
-            '% Change':         f"{total_chg_p_sum:+.1f}%",
-            'Tier':             '',
-            'Sales Rep':        '',
-        }])
-
-        # Separator row (blank line between data and totals)
-        separator_row = pd.DataFrame([{
-            'Account': '─' * 40,
-            'YTD Sales': '', 'Prior Year Sales': '',
-            '$ Change': '', '% Change': '', 'Tier': '', 'Sales Rep': ''
-        }])
-
-        final_df = pd.concat([display_df, separator_row, totals_row], ignore_index=True)
-
-        st.dataframe(final_df, use_container_width=True, hide_index=True,
-                     height=min(600, (len(final_df) + 1) * 35 + 38))
+        st.dataframe(display_df, use_container_width=True, hide_index=True,
+                     height=min(600, (len(display_df) + 1) * 35 + 38))
 
     # ------------------------------------------------------------------
     # TAB 2 — Charts
@@ -1365,25 +1356,11 @@ def main():
         export_df = filtered_df[['Account', 'YTD Sales', 'Prior Year Sales',
                                   '$ Change', '% Change', 'Tier', 'Sales Rep']].copy()
 
-        # Add totals row to export
-        export_totals = pd.DataFrame([{
-            'Account':          f"TOTAL ({len(export_df)} accounts)",
-            'YTD Sales':        export_df['YTD Sales'].sum(),
-            'Prior Year Sales': export_df['Prior Year Sales'].sum(),
-            '$ Change':         export_df['$ Change'].sum(),
-            '% Change':         ((export_df['YTD Sales'].sum() - export_df['Prior Year Sales'].sum())
-                                  / export_df['Prior Year Sales'].sum() * 100)
-                                 if export_df['Prior Year Sales'].sum() > 0 else 0,
-            'Tier':             '',
-            'Sales Rep':        '',
-        }])
-        export_with_totals = pd.concat([export_df, export_totals], ignore_index=True)
-
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("### Excel")
             st.write(f"{len(export_df)} accounts")
-            excel_data = export_to_excel(export_with_totals)
+            excel_data = export_to_excel(export_df)
             st.download_button(
                 label="⬇️ Download Excel",
                 data=excel_data,
@@ -1395,7 +1372,7 @@ def main():
             st.write(f"{len(export_df)} accounts")
             st.download_button(
                 label="⬇️ Download CSV",
-                data=export_with_totals.to_csv(index=False),
+                data=export_df.to_csv(index=False),
                 file_name=f"sales_report_{datetime.now().strftime('%Y%m%d')}.csv",
                 mime="text/csv"
             )
