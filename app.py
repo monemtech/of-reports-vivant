@@ -28,7 +28,13 @@ st.set_page_config(
 # =============================================================================
 # CONSTANTS & CONFIG
 # =============================================================================
-CONFIG_FILE = Path(".orderfloz_reports_config.json")
+CONFIG_FILE      = Path(".orderfloz_reports_config.json")
+CACHE_META_FILE  = Path(".orderfloz_cache_meta.json")
+CACHE_DIR        = Path(".orderfloz_cache")
+CACHE_DIR.mkdir(exist_ok=True)
+
+# How long HubSpot data is considered fresh before re-fetching
+HUBSPOT_TTL_HOURS = 4
 
 BRANDING = {
     "company_name": "OrderFloz",
@@ -36,14 +42,13 @@ BRANDING = {
     "accent_color": "#00d4aa"
 }
 
-CURRENT_YEAR = datetime.now().year
-ANALYSIS_YEARS = [CURRENT_YEAR - 2, CURRENT_YEAR - 1, CURRENT_YEAR]  # default fallback
+CURRENT_YEAR  = datetime.now().year
+ANALYSIS_YEARS = [CURRENT_YEAR - 2, CURRENT_YEAR - 1, CURRENT_YEAR]
 
 # =============================================================================
 # CONFIG PERSISTENCE
 # =============================================================================
 def load_config() -> dict:
-    """Load saved config (date prefs) from disk."""
     try:
         if CONFIG_FILE.exists():
             return json.loads(CONFIG_FILE.read_text())
@@ -52,7 +57,6 @@ def load_config() -> dict:
     return {}
 
 def save_config(data: dict):
-    """Save config (date prefs) to disk."""
     try:
         existing = load_config()
         existing.update(data)
@@ -61,11 +65,113 @@ def save_config(data: dict):
         pass
 
 def get_secret(key: str, default: str = "") -> str:
-    """Read from Streamlit secrets if available, else return default."""
     try:
         return st.secrets.get(key, default)
     except Exception:
         return default
+
+# =============================================================================
+# DISK CACHE  (orders + HubSpot)
+# =============================================================================
+import pickle
+import hashlib
+
+def _cache_key(label: str) -> str:
+    """Stable filename-safe key for a period label."""
+    return hashlib.md5(label.encode()).hexdigest()
+
+def _load_cache_meta() -> dict:
+    try:
+        if CACHE_META_FILE.exists():
+            return json.loads(CACHE_META_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+def _save_cache_meta(meta: dict):
+    try:
+        CACHE_META_FILE.write_text(json.dumps(meta))
+    except Exception:
+        pass
+
+def cache_save_orders(label: str, orders: list, fingerprint: str):
+    """Persist orders list + fingerprint for a period label."""
+    try:
+        key  = _cache_key(label)
+        path = CACHE_DIR / f"orders_{key}.pkl"
+        with open(path, "wb") as f:
+            pickle.dump(orders, f)
+        meta = _load_cache_meta()
+        meta[f"cin7_{key}"] = {"label": label, "fingerprint": fingerprint,
+                                "saved_at": datetime.now().isoformat()}
+        _save_cache_meta(meta)
+    except Exception:
+        pass
+
+def cache_load_orders(label: str, fingerprint: str):
+    """
+    Return cached orders if fingerprint matches, else None.
+    For closed periods (end < today) fingerprint is ignored — data can never change.
+    """
+    try:
+        key  = _cache_key(label)
+        meta = _load_cache_meta()
+        entry = meta.get(f"cin7_{key}")
+        if not entry:
+            return None
+        path = CACHE_DIR / f"orders_{key}.pkl"
+        if not path.exists():
+            return None
+        # Accept stale fingerprint for closed (past) periods — they can't change
+        if entry["fingerprint"] == fingerprint or fingerprint == "CLOSED":
+            with open(path, "rb") as f:
+                return pickle.load(f)
+    except Exception:
+        pass
+    return None
+
+def cache_save_hubspot(tiers: dict, owners: dict):
+    """Persist HubSpot company data with timestamp."""
+    try:
+        path = CACHE_DIR / "hubspot.pkl"
+        with open(path, "wb") as f:
+            pickle.dump({"tiers": tiers, "owners": owners}, f)
+        meta = _load_cache_meta()
+        meta["hubspot"] = {"saved_at": datetime.now().isoformat()}
+        _save_cache_meta(meta)
+    except Exception:
+        pass
+
+def cache_load_hubspot():
+    """Return (tiers, owners) if cache is within TTL, else (None, None)."""
+    try:
+        meta  = _load_cache_meta()
+        entry = meta.get("hubspot")
+        if not entry:
+            return None, None
+        saved_at = datetime.fromisoformat(entry["saved_at"])
+        age_hours = (datetime.now() - saved_at).total_seconds() / 3600
+        if age_hours > HUBSPOT_TTL_HOURS:
+            return None, None
+        path = CACHE_DIR / "hubspot.pkl"
+        if not path.exists():
+            return None, None
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        return data["tiers"], data["owners"]
+    except Exception:
+        pass
+    return None, None
+
+def cache_clear_all():
+    """Wipe all cached data (manual override)."""
+    try:
+        for f in CACHE_DIR.iterdir():
+            f.unlink()
+        if CACHE_META_FILE.exists():
+            CACHE_META_FILE.unlink()
+    except Exception:
+        pass
 
 # =============================================================================
 # SESSION STATE
@@ -99,6 +205,33 @@ def test_cin7_connection(username: str, api_key: str) -> tuple:
             return False, f"Error {r.status_code}"
     except Exception as e:
         return False, str(e)
+
+def probe_cin7_fingerprint(username: str, api_key: str,
+                           start_date: str, end_date: str) -> str:
+    """
+    Fetch ONE order (latest modified) for a date range to get a change fingerprint.
+    Returns "id:modifiedDate" string.  Fast — single API call, 1 row.
+    """
+    try:
+        r = requests.get(
+            "https://api.cin7.com/api/v1/SalesOrders",
+            auth=(username, api_key),
+            params={
+                "where": f"createdDate >= '{start_date}' AND createdDate <= '{end_date}'",
+                "rows": 1,
+                "order": "modifiedDate desc",
+                "fields": "id,modifiedDate"
+            },
+            timeout=10
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if data:
+                o = data[0]
+                return f"{o.get('id','')}:{o.get('modifiedDate','')}"
+    except Exception:
+        pass
+    return ""
 
 def fetch_orders_by_date_range(username: str, api_key: str,
                                start_date: str, end_date: str,
@@ -836,58 +969,110 @@ def main():
         # Generate Report Button
         can_generate = cin7_user and cin7_key
 
+        # Cache status
+        meta = _load_cache_meta()
+        cached_periods = [v["label"] for k, v in meta.items() if k.startswith("cin7_")]
+        hs_entry = meta.get("hubspot")
+        if cached_periods:
+            age_info = ""
+            if hs_entry:
+                hs_age = (datetime.now() - datetime.fromisoformat(hs_entry["saved_at"])).total_seconds() / 3600
+                age_info = f" · HubSpot {hs_age:.1f}h ago"
+            st.caption(f"💾 Cache: {len(cached_periods)} period(s){age_info}")
+            if st.button("🗑️ Clear Cache", use_container_width=True):
+                cache_clear_all()
+                st.session_state.report_data = None
+                st.rerun()
+
         if st.button("🔄 Generate Report", type="primary",
                      use_container_width=True, disabled=not can_generate):
-            with st.spinner("Building report..."):
+            with st.spinner("Checking for updates..."):
                 progress_text = st.empty()
 
-                # Save period preferences for next session
-                save_config({
-                    "last_period":  selected_period,
-                    "last_compare": compare_to,
-                })
-
-                # Store period config in session state
+                save_config({"last_period": selected_period, "last_compare": compare_to})
                 st.session_state.periods = periods
 
-                # Fetch Cin7 orders for ALL periods in parallel
-                progress_text.text("Fetching orders (parallel)...")
-                all_orders = fetch_all_periods_parallel(
-                    cin7_user, cin7_key, periods,
-                    status_placeholder=progress_text
-                )
+                today = datetime.now().date()
+                all_orders   = []
+                cache_hits   = 0
+                cache_misses = 0
+
+                # ── Per-period: probe → cache check → fetch if needed ──────
                 for p in periods:
-                    count = sum(1 for o in all_orders
-                                if o.get('createdDate','')[:10] >= str(p["start"])
-                                and o.get('createdDate','')[:10] <= str(p["end"]))
-                    st.sidebar.info(f"📅 {p['label']}: ~{count} orders")
+                    start_str = p["start"].strftime("%Y-%m-%dT00:00:00Z")
+                    end_str   = p["end"].strftime("%Y-%m-%dT23:59:59Z")
+                    label     = p["label"]
 
-                # Aggregate by company
-                progress_text.text("Aggregating by company...")
-                company_data = aggregate_orders_by_company(all_orders, periods)
+                    # Closed period = end date is in the past; data is immutable
+                    is_closed = p["end"] < today
 
-                # Fetch HubSpot — single call for BOTH tiers and owners
-                hubspot_tiers  = {}
-                company_owners = {}
-                owners_lookup  = {}
+                    if is_closed:
+                        # Try cache first — no probe needed for closed periods
+                        cached = cache_load_orders(label, "CLOSED")
+                        if cached is not None:
+                            all_orders.extend(cached)
+                            cache_hits += 1
+                            st.sidebar.success(f"✅ {label}: {len(cached)} orders (cached)")
+                            continue
+
+                    # Open (or no cache) → probe for fingerprint
+                    progress_text.text(f"Checking {label} for changes...")
+                    fingerprint = probe_cin7_fingerprint(
+                        cin7_user, cin7_key, start_str, end_str)
+
+                    cached = cache_load_orders(label, fingerprint)
+                    if cached is not None:
+                        all_orders.extend(cached)
+                        cache_hits += 1
+                        st.sidebar.success(f"✅ {label}: {len(cached)} orders (cached)")
+                    else:
+                        # Full fetch needed
+                        cache_misses += 1
+                        progress_text.text(f"Downloading {label} orders...")
+                        period_orders = fetch_orders_by_date_range(
+                            cin7_user, cin7_key, start_str, end_str, label=label,
+                            progress_callback=lambda msg: progress_text.text(msg)
+                        )
+                        cache_save_orders(label, period_orders,
+                                          "CLOSED" if is_closed else fingerprint)
+                        all_orders.extend(period_orders)
+                        st.sidebar.info(f"🔄 {label}: {len(period_orders)} orders (fresh)")
+
+                # ── HubSpot: TTL cache ──────────────────────────────────────
+                hubspot_tiers, company_owners = cache_load_hubspot()
+                owners_lookup = {}
+
                 if hubspot_key:
-                    progress_text.text("Fetching HubSpot data (1 call)...")
-                    hubspot_tiers, company_owners = fetch_hubspot_company_data(
-                        hubspot_key, tier_property,
-                        progress_callback=lambda msg: progress_text.text(msg)
-                    )
-                    owners_lookup = fetch_hubspot_owners(hubspot_key)
-                    st.sidebar.info(f"🏢 HubSpot: {len(hubspot_tiers)} companies, {len(owners_lookup)} reps")
-                
-                # Build report
+                    if hubspot_tiers is not None:
+                        st.sidebar.success(
+                            f"✅ HubSpot: {len(hubspot_tiers)} companies (cached)")
+                        owners_lookup = fetch_hubspot_owners(hubspot_key)
+                    else:
+                        progress_text.text("Fetching HubSpot data...")
+                        hubspot_tiers, company_owners = fetch_hubspot_company_data(
+                            hubspot_key, tier_property,
+                            progress_callback=lambda msg: progress_text.text(msg)
+                        )
+                        owners_lookup = fetch_hubspot_owners(hubspot_key)
+                        cache_save_hubspot(hubspot_tiers, company_owners)
+                        st.sidebar.info(
+                            f"🔄 HubSpot: {len(hubspot_tiers)} companies (fresh)")
+                else:
+                    hubspot_tiers  = {}
+                    company_owners = {}
+
+                # ── Build report ────────────────────────────────────────────
                 progress_text.text("Building report...")
-                df = build_report_dataframe(company_data, hubspot_tiers, periods, company_owners, owners_lookup)
-                
-                st.session_state.report_data = df
-                st.session_state.cin7_orders_cache = all_orders
+                company_data = aggregate_orders_by_company(all_orders, periods)
+                df = build_report_dataframe(
+                    company_data, hubspot_tiers, periods, company_owners, owners_lookup)
+
+                st.session_state.report_data            = df
+                st.session_state.cin7_orders_cache      = all_orders
                 st.session_state.hubspot_companies_cache = hubspot_tiers
-                
-                progress_text.text("✅ Report ready!")
+
+                summary = f"✅ Done — {cache_hits} period(s) from cache, {cache_misses} refreshed"
+                progress_text.text(summary)
                 st.rerun()
     
     # =========================================================================
