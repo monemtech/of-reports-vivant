@@ -234,37 +234,51 @@ def probe_cin7_fingerprint(username: str, api_key: str,
     return ""
 
 # Only fetch the fields we actually use — cuts payload by ~85%
+# NOTE: if Cin7 rejects the fields param, we fall back to full fetch automatically
 CIN7_FIELDS = "id,company,billingCompany,firstName,lastName,total,createdDate,modifiedDate,salesPersonEmail,source"
 
 def fetch_orders_by_date_range(username: str, api_key: str,
                                start_date: str, end_date: str,
                                label: str = "",
                                progress_callback=None) -> list:
-    """Fetch all orders between two dates from Cin7, minimal fields only."""
+    """Fetch all orders between two dates from Cin7."""
     all_orders = []
     page = 1
+    use_fields = True  # try slim fetch first; fall back to full if rejected
+
     while True:
         if progress_callback:
             progress_callback(f"Fetching {label} orders... page {page} ({len(all_orders)} so far)")
         try:
+            params = {
+                "where": f"createdDate >= '{start_date}' AND createdDate <= '{end_date}'",
+                "page":  page,
+                "rows":  250,
+            }
+            if use_fields:
+                params["fields"] = CIN7_FIELDS
+
             r = requests.get(
                 "https://api.cin7.com/api/v1/SalesOrders",
                 auth=(username, api_key),
-                params={
-                    "where":  f"createdDate >= '{start_date}' AND createdDate <= '{end_date}'",
-                    "fields": CIN7_FIELDS,
-                    "page":   page,
-                    "rows":   500          # max allowed; fewer round trips
-                },
+                params=params,
                 timeout=60
             )
+
+            # If fields param caused a 400/422, retry without it
+            if r.status_code in (400, 422) and use_fields:
+                use_fields = False
+                continue
+
             if r.status_code != 200:
+                st.warning(f"Cin7 returned {r.status_code} on page {page}: {r.text[:200]}")
                 break
+
             orders = r.json()
             if not orders:
                 break
             all_orders.extend(orders)
-            if len(orders) < 500:
+            if len(orders) < 250:
                 break
             page += 1
         except Exception as e:
