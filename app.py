@@ -95,7 +95,9 @@ def _save_cache_meta(meta: dict):
         pass
 
 def cache_save_orders(label: str, orders: list, fingerprint: str):
-    """Persist orders list + fingerprint for a period label."""
+    """Persist orders list + fingerprint. Never saves empty results."""
+    if not orders:          # empty = broken fetch; do not poison cache
+        return
     try:
         key  = _cache_key(label)
         path = CACHE_DIR / f"orders_{key}.pkl"
@@ -103,7 +105,8 @@ def cache_save_orders(label: str, orders: list, fingerprint: str):
             pickle.dump(orders, f)
         meta = _load_cache_meta()
         meta[f"cin7_{key}"] = {"label": label, "fingerprint": fingerprint,
-                                "saved_at": datetime.now().isoformat()}
+                                "saved_at": datetime.now().isoformat(),
+                                "count": len(orders)}
         _save_cache_meta(meta)
     except Exception:
         pass
@@ -111,6 +114,7 @@ def cache_save_orders(label: str, orders: list, fingerprint: str):
 def cache_load_orders(label: str, fingerprint: str):
     """
     Return cached orders if fingerprint matches, else None.
+    Rejects empty caches (poisoned from a prior failed fetch).
     For closed periods (end < today) fingerprint is ignored — data can never change.
     """
     try:
@@ -119,13 +123,18 @@ def cache_load_orders(label: str, fingerprint: str):
         entry = meta.get(f"cin7_{key}")
         if not entry:
             return None
+        # Reject anything cached with zero orders
+        if entry.get("count", 1) == 0:
+            return None
         path = CACHE_DIR / f"orders_{key}.pkl"
         if not path.exists():
             return None
-        # Accept stale fingerprint for closed (past) periods — they can't change
         if entry["fingerprint"] == fingerprint or fingerprint == "CLOSED":
-            with open(path, "rb") as f:
-                return pickle.load(f)
+            data = pickle.load(open(path, "rb"))
+            # Double-check loaded data isn't empty
+            if not data:
+                return None
+            return data
     except Exception:
         pass
     return None
@@ -173,6 +182,23 @@ def cache_clear_all():
     except Exception:
         pass
 
+def cache_purge_empty_entries():
+    """On startup, remove any cached periods that stored 0 orders (poisoned cache)."""
+    try:
+        meta = _load_cache_meta()
+        dirty = False
+        for k, v in list(meta.items()):
+            if k.startswith("cin7_") and v.get("count", 1) == 0:
+                pkl = CACHE_DIR / f"orders_{k[5:]}.pkl"
+                if pkl.exists():
+                    pkl.unlink()
+                del meta[k]
+                dirty = True
+        if dirty:
+            _save_cache_meta(meta)
+    except Exception:
+        pass
+
 # =============================================================================
 # SESSION STATE
 # =============================================================================
@@ -184,6 +210,9 @@ if 'hubspot_companies_cache' not in st.session_state:
     st.session_state.hubspot_companies_cache = None
 if 'config_loaded' not in st.session_state:
     st.session_state.config_loaded = load_config()
+
+# Auto-remove any zero-order cache entries from prior broken runs
+cache_purge_empty_entries()
 
 # =============================================================================
 # CIN7 API FUNCTIONS
