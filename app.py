@@ -208,6 +208,8 @@ if 'cin7_orders_cache' not in st.session_state:
     st.session_state.cin7_orders_cache = None
 if 'hubspot_companies_cache' not in st.session_state:
     st.session_state.hubspot_companies_cache = None
+if 'audit' not in st.session_state:
+    st.session_state.audit = None
 if 'config_loaded' not in st.session_state:
     st.session_state.config_loaded = load_config()
 
@@ -346,12 +348,14 @@ def fetch_all_periods_parallel(username: str, api_key: str, periods: list,
     for p in periods:
         all_orders.extend(results.get(p["label"], []))
     return all_orders
-def aggregate_orders_by_company(orders: list, periods: list) -> dict:
+def aggregate_orders_by_company(orders: list, periods: list) -> tuple:
     """
     Aggregate orders by company name across dynamic periods.
-    Returns dict: {company_name: {period_label: total, 'rep': sales_rep}}
+    Returns: (company_data dict, audit dict)
+
+    company_data: {company_name: {period_label: total, 'rep': ..., 'order_count': ...}}
+    audit: detailed breakdown of what was included vs excluded and why
     """
-    # Build date->period label lookup
     def get_period_label(date_str):
         if not date_str:
             return None
@@ -364,35 +368,78 @@ def aggregate_orders_by_company(orders: list, periods: list) -> dict:
                 return p["label"]
         return None
 
-    company_data = {}
+    company_data  = {}
     period_labels = [p["label"] for p in periods]
+
+    # Audit counters
+    audit = {
+        "total_raw":            len(orders),
+        "included":             0,
+        "excluded_source":      0,         # shopify / retail
+        "excluded_no_period":   0,         # outside all date windows
+        "excluded_zero_total":  0,         # $0 orders
+        "unknown_company":      0,         # no company name resolved
+        "by_period":            {lbl: {"included": 0, "excluded_source": 0,
+                                        "revenue": 0.0} for lbl in period_labels},
+        "excluded_sources":     {},        # tally of which source values were dropped
+        "sample_excluded":      [],        # up to 10 example dropped orders
+    }
 
     for order in orders:
         company = (order.get('company') or order.get('billingCompany') or '').strip()
         if not company:
             first = order.get('firstName', '')
-            last = order.get('lastName', '')
+            last  = order.get('lastName', '')
             company = f"{first} {last}".strip() or 'Unknown'
+            if company == 'Unknown':
+                audit["unknown_company"] += 1
 
-        total = float(order.get('total') or 0)
-        rep_email = (order.get('salesPersonEmail') or '').strip()
+        total        = float(order.get('total') or 0)
+        rep_email    = (order.get('salesPersonEmail') or '').strip()
         created_date = order.get('createdDate', '')
         period_label = get_period_label(created_date)
+        source       = (order.get('source') or '').strip()
+        source_lower = source.lower()
+
+        # Check exclusion reasons
+        if 'shopify' in source_lower or 'retail' in source_lower:
+            audit["excluded_source"] += 1
+            audit["excluded_sources"][source] = audit["excluded_sources"].get(source, 0) + 1
+            if period_label and period_label in period_labels:
+                audit["by_period"][period_label]["excluded_source"] += 1
+            if len(audit["sample_excluded"]) < 10:
+                audit["sample_excluded"].append({
+                    "reason": f"source={source}",
+                    "company": company,
+                    "total": total,
+                    "date": created_date[:10] if created_date else "",
+                })
+            continue
+
+        if period_label is None or period_label not in period_labels:
+            audit["excluded_no_period"] += 1
+            continue
+
+        if total == 0:
+            audit["excluded_zero_total"] += 1
+            # still count the company but don't add revenue
 
         if company not in company_data:
             company_data[company] = {'rep': rep_email, 'order_count': 0}
             for lbl in period_labels:
                 company_data[company][lbl] = 0.0
 
-        source = (order.get('source') or '').lower()
-        if 'shopify' not in source and 'retail' not in source:
-            if period_label and period_label in period_labels:
-                company_data[company][period_label] += total
-                company_data[company]['order_count'] += 1
-            if rep_email and not company_data[company]['rep']:
-                company_data[company]['rep'] = rep_email
+        company_data[company][period_label] += total
+        company_data[company]['order_count'] += 1
+        if rep_email and not company_data[company]['rep']:
+            company_data[company]['rep'] = rep_email
 
-    return company_data
+        audit["included"] += 1
+        audit["by_period"][period_label]["included"] += 1
+        audit["by_period"][period_label]["revenue"]  += total
+
+    audit["unique_companies"] = len(company_data)
+    return company_data, audit
 
 # =============================================================================
 # HUBSPOT API FUNCTIONS
@@ -1110,13 +1157,14 @@ def main():
 
                 # ── Build report ────────────────────────────────────────────
                 progress_text.text("Building report...")
-                company_data = aggregate_orders_by_company(all_orders, periods)
+                company_data, audit = aggregate_orders_by_company(all_orders, periods)
                 df = build_report_dataframe(
                     company_data, hubspot_tiers, periods, company_owners, owners_lookup)
 
-                st.session_state.report_data            = df
-                st.session_state.cin7_orders_cache      = all_orders
+                st.session_state.report_data             = df
+                st.session_state.cin7_orders_cache       = all_orders
                 st.session_state.hubspot_companies_cache = hubspot_tiers
+                st.session_state.audit                   = audit
 
                 summary = f"✅ Done — {cache_hits} period(s) from cache, {cache_misses} refreshed"
                 progress_text.text(summary)
@@ -1219,7 +1267,7 @@ def main():
     # TABS: Table | Charts | Export
     # -------------------------------------------------------------------------
     st.divider()
-    tab1, tab2, tab3 = st.tabs(["📋 Account Report", "📈 Charts", "📤 Export"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📋 Account Report", "📈 Charts", "📤 Export", "🔍 Data Audit"])
 
     # ------------------------------------------------------------------
     # TAB 1 — Account Report (exactly the 7 columns)
@@ -1334,6 +1382,87 @@ def main():
                 file_name=f"sales_report_{datetime.now().strftime('%Y%m%d')}.csv",
                 mime="text/csv"
             )
+
+    # ------------------------------------------------------------------
+    # TAB 4 — Data Audit
+    # ------------------------------------------------------------------
+    with tab4:
+        audit = st.session_state.get('audit')
+        if not audit:
+            st.info("Run a report first to see the data audit.")
+        else:
+            st.subheader("🔍 Data Audit — What Was Imported")
+
+            # ── Top-level order counts ────────────────────────────────
+            total   = audit['total_raw']
+            kept    = audit['included']
+            dropped = total - kept
+
+            c1, c2, c3, c4 = st.columns(4)
+            with c1: st.metric("Raw Orders Fetched",  f"{total:,}")
+            with c2: st.metric("Included in Report",  f"{kept:,}",
+                                delta=f"{kept/total*100:.1f}% of total" if total else "0%")
+            with c3: st.metric("Dropped / Excluded",  f"{dropped:,}",
+                                delta=f"-{dropped/total*100:.1f}%" if total else "0%",
+                                delta_color="inverse")
+            with c4: st.metric("Unique Companies",    f"{audit.get('unique_companies', 0):,}")
+
+            st.divider()
+
+            # ── Breakdown by exclusion reason ─────────────────────────
+            st.markdown("#### Why Orders Were Excluded")
+            excl_data = {
+                "Reason": [
+                    "Shopify / Retail channel (B2C, excluded by design)",
+                    "Outside selected date windows",
+                    "$0 total orders",
+                    "No company name (mapped to 'Unknown')",
+                ],
+                "Count": [
+                    audit['excluded_source'],
+                    audit['excluded_no_period'],
+                    audit['excluded_zero_total'],
+                    audit['unknown_company'],
+                ]
+            }
+            excl_df = pd.DataFrame(excl_data)
+            excl_df['% of Raw'] = excl_df['Count'].apply(
+                lambda x: f"{x/total*100:.1f}%" if total else "0%")
+            st.dataframe(excl_df, use_container_width=True, hide_index=True)
+
+            # ── Source values that triggered exclusion ────────────────
+            if audit['excluded_sources']:
+                st.markdown("#### Excluded Source Values (from Cin7 `source` field)")
+                src_df = pd.DataFrame([
+                    {"Source Value": k, "Orders Dropped": v}
+                    for k, v in sorted(audit['excluded_sources'].items(),
+                                       key=lambda x: -x[1])
+                ])
+                st.dataframe(src_df, use_container_width=True, hide_index=True)
+                st.caption("⚠️ If any of these sources should be included in B2B wholesale revenue, "
+                           "let Sam know to adjust the source filter logic.")
+
+            st.divider()
+
+            # ── Per-period breakdown ──────────────────────────────────
+            st.markdown("#### Orders & Revenue by Period")
+            period_rows = []
+            for lbl, stats in audit['by_period'].items():
+                period_rows.append({
+                    "Period":           lbl,
+                    "Included Orders":  stats['included'],
+                    "Revenue":          f"${stats['revenue']:,.2f}",
+                    "Excluded (B2C)":   stats['excluded_source'],
+                })
+            st.dataframe(pd.DataFrame(period_rows), use_container_width=True, hide_index=True)
+
+            st.divider()
+
+            # ── Sample excluded orders ────────────────────────────────
+            if audit['sample_excluded']:
+                st.markdown("#### Sample Excluded Orders (first 10)")
+                st.dataframe(pd.DataFrame(audit['sample_excluded']),
+                             use_container_width=True, hide_index=True)
 
     st.markdown("---")
     st.markdown(
