@@ -136,46 +136,36 @@ def fetch_orders_by_date_range(username: str, api_key: str,
     return all_orders
 
 
-def fetch_all_orders_by_year(username: str, api_key: str, year: int,
-                             progress_callback=None) -> list:
-    """Fetch all orders for a specific year from Cin7."""
-    start_date = f"{year}-01-01T00:00:00Z"
-    end_date = f"{year}-12-31T23:59:59Z"
-    
-    all_orders = []
-    page = 1
-    
-    while True:
-        if progress_callback:
-            progress_callback(f"Fetching {year} orders... page {page} ({len(all_orders)} so far)")
-        
-        try:
-            r = requests.get(
-                "https://api.cin7.com/api/v1/SalesOrders",
-                auth=(username, api_key),
-                params={
-                    "where": f"createdDate >= '{start_date}' AND createdDate <= '{end_date}'",
-                    "page": page,
-                    "rows": 250
-                },
-                timeout=60
-            )
-            if r.status_code != 200:
-                break
-            orders = r.json()
-            if not orders:
-                break
-            all_orders.extend(orders)
-            
-            if len(orders) < 250:
-                break
-            page += 1
-        except Exception as e:
-            st.warning(f"Error fetching page {page}: {e}")
-            break
-    
-    return all_orders
+def fetch_all_periods_parallel(username: str, api_key: str, periods: list,
+                                status_placeholder=None) -> list:
+    """
+    Fetch all periods in parallel using threads.
+    Returns combined flat list of all orders.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
+    results = {}
+
+    def fetch_one(p):
+        start_str = p["start"].strftime("%Y-%m-%dT00:00:00Z")
+        end_str   = p["end"].strftime("%Y-%m-%dT23:59:59Z")
+        orders = fetch_orders_by_date_range(username, api_key, start_str, end_str, label=p["label"])
+        return p["label"], orders
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(fetch_one, p): p for p in periods}
+        for future in as_completed(futures):
+            label, orders = future.result()
+            results[label] = orders
+            if status_placeholder:
+                done = len(results)
+                status_placeholder.text(f"Fetching orders... {done}/{len(periods)} periods complete")
+
+    # Flatten in period order
+    all_orders = []
+    for p in periods:
+        all_orders.extend(results.get(p["label"], []))
+    return all_orders
 def aggregate_orders_by_company(orders: list, periods: list) -> dict:
     """
     Aggregate orders by company name across dynamic periods.
@@ -338,21 +328,29 @@ def fetch_hubspot_owners(api_key: str) -> dict:
         return {}
 
 
-def fetch_hubspot_company_owners(api_key: str, progress_callback=None) -> dict:
+def fetch_hubspot_company_data(api_key: str, tier_property: str = "commission_tier",
+                               progress_callback=None) -> tuple:
     """
-    Fetch all HubSpot companies with their assigned owner (hubspot_owner_id).
-    Returns dict: {company_name_upper: owner_id}
+    Single HubSpot companies fetch that returns BOTH tiers and owner IDs.
+    Replaces fetch_hubspot_companies_with_tier + fetch_hubspot_company_owners.
+    Returns: (tiers_dict, company_owners_dict)
+      tiers_dict:         {company_name_upper: tier_value}
+      company_owners_dict:{company_name_upper: owner_id}
     """
     headers = get_hubspot_headers(api_key)
-    company_owners = {}
+    tiers = {}
+    owners = {}
     after = None
     page = 1
 
     while True:
         if progress_callback:
-            progress_callback(f"Fetching HubSpot company owners... page {page}")
+            progress_callback(f"Fetching HubSpot companies... page {page}")
 
-        params = {"limit": 100, "properties": "name,hubspot_owner_id"}
+        params = {
+            "limit": 100,
+            "properties": f"name,{tier_property},hubspot_owner_id"
+        }
         if after:
             params["after"] = after
 
@@ -370,9 +368,12 @@ def fetch_hubspot_company_owners(api_key: str, progress_callback=None) -> dict:
             for company in data.get('results', []):
                 props = company.get('properties', {})
                 name = (props.get('name') or '').strip().upper()
-                owner_id = props.get('hubspot_owner_id') or ''
-                if name and owner_id:
-                    company_owners[name] = str(owner_id)
+                if not name:
+                    continue
+                tiers[name]  = props.get(tier_property, '') or ''
+                owner_id     = props.get('hubspot_owner_id') or ''
+                if owner_id:
+                    owners[name] = str(owner_id)
 
             paging = data.get('paging', {})
             after = paging.get('next', {}).get('after')
@@ -381,10 +382,10 @@ def fetch_hubspot_company_owners(api_key: str, progress_callback=None) -> dict:
             page += 1
 
         except Exception as e:
-            st.warning(f"Error fetching company owners: {e}")
+            st.warning(f"Error fetching HubSpot companies: {e}")
             break
 
-    return company_owners
+    return tiers, owners
 
 
 # =============================================================================
@@ -393,20 +394,37 @@ def fetch_hubspot_company_owners(api_key: str, progress_callback=None) -> dict:
 def build_report_dataframe(company_data: dict, hubspot_tiers: dict, periods: list,
                            company_owners: dict = None, owners_lookup: dict = None) -> pd.DataFrame:
     """
-    Build the final report DataFrame combining Cin7 sales and HubSpot tiers.
+    Build the management report DataFrame with fixed semantic column names.
+
+    Always outputs:
+        Account | YTD Sales | Prior Year Sales | $ Change | % Change | Tier | Sales Rep
+
+    The 'periods' list drives what data fills each column:
+      - Last period  = primary (YTD Sales)
+      - Second-to-last = comparison (Prior Year Sales)
+    Column names are intentionally static so reports are always readable
+    regardless of the current year.
     """
     rows = []
+
+    # Determine which period label maps to which semantic column
+    # periods always has 2-3 entries; last = primary, second-to-last = comparison
     labels = [p["label"] for p in periods]
-    l1, l2, l3 = labels[0], labels[1], labels[2]
+    primary_label     = labels[-1]   # e.g. "2026 YTD"
+    comparison_label  = labels[-2] if len(labels) >= 2 else None
 
     for company, data in company_data.items():
-        total_sales = sum(data.get(lbl, 0) for lbl in labels)
-        if total_sales == 0:
+        ytd_sales  = data.get(primary_label, 0)
+        prior_sales = data.get(comparison_label, 0) if comparison_label else 0
+
+        # Skip accounts with zero activity in both periods
+        if ytd_sales == 0 and prior_sales == 0:
             continue
 
+        # Tier from HubSpot
         tier = hubspot_tiers.get(company.upper(), '')
 
-        # Sales rep: prefer Cin7 salesPersonEmail, fall back to HubSpot company owner
+        # Sales rep: Cin7 first, HubSpot owner fallback
         cin7_rep = data.get('rep', '')
         if cin7_rep:
             rep = cin7_rep
@@ -415,33 +433,33 @@ def build_report_dataframe(company_data: dict, hubspot_tiers: dict, periods: lis
             rep = owners_lookup.get(owner_id, '') if owner_id else ''
         else:
             rep = ''
-        s1 = data.get(l1, 0)
-        s2 = data.get(l2, 0)
-        s3 = data.get(l3, 0)
 
-        change_s2_s1_pct = ((s2 - s1) / s1 * 100) if s1 > 0 else (100.0 if s2 > 0 else 0.0)
-        change_s2_s1_dollars = s2 - s1
-        change_s3_s2_pct = ((s3 - s2) / s2 * 100) if s2 > 0 else (100.0 if s3 > 0 else 0.0)
-        change_s3_s2_dollars = s3 - s2
+        # Change calculations (YTD vs Prior)
+        if prior_sales > 0:
+            change_pct = ((ytd_sales - prior_sales) / prior_sales) * 100
+        elif ytd_sales > 0:
+            change_pct = 100.0
+        else:
+            change_pct = 0.0
+        change_dollars = ytd_sales - prior_sales
 
         rows.append({
-            'Company': company,
-            f'{l1} Sales': s1,
-            f'{l2} Sales': s2,
-            f'{l3} Sales': s3,
-            f'{l2} vs {l1} ($)': change_s2_s1_dollars,
-            f'{l2} vs {l1} (%)': change_s2_s1_pct,
-            f'{l3} vs {l2} ($)': change_s3_s2_dollars,
-            f'{l3} vs {l2} (%)': change_s3_s2_pct,
-            'Total Sales': total_sales,
-            'Sales Rep': rep,
-            'Tier': tier,
-            'Order Count': data.get('order_count', 0)
+            'Account':            company,
+            'YTD Sales':          ytd_sales,
+            'Prior Year Sales':   prior_sales,
+            '$ Change':           change_dollars,
+            '% Change':           change_pct,
+            'Tier':               tier,
+            'Sales Rep':          rep,
+            # Keep these for internal filtering/sorting, hidden from main table
+            '_order_count':       data.get('order_count', 0),
+            '_primary_label':     primary_label,
+            '_comparison_label':  comparison_label or '',
         })
 
     df = pd.DataFrame(rows)
     if not df.empty:
-        df = df.sort_values('Total Sales', ascending=False)
+        df = df.sort_values('YTD Sales', ascending=False).reset_index(drop=True)
     return df
 
 # =============================================================================
@@ -519,19 +537,21 @@ def inject_css():
 # CHART FUNCTIONS
 # =============================================================================
 def create_yoy_chart(df: pd.DataFrame, periods: list):
-    """Create Year-over-Year comparison chart."""
+    """Top 15 accounts — YTD vs Prior Year bar chart."""
     import plotly.graph_objects as go
 
-    l1, l2, l3 = periods[0]["label"], periods[1]["label"], periods[2]["label"]
-    top_companies = df.nlargest(15, 'Total Sales')
+    top = df.nlargest(15, 'YTD Sales')
+    primary_label    = periods[-1]["label"] if periods else "YTD"
+    comparison_label = periods[-2]["label"] if len(periods) >= 2 else "Prior Year"
 
     fig = go.Figure()
-    fig.add_trace(go.Bar(name=l1, x=top_companies['Company'], y=top_companies[f'{l1} Sales'], marker_color='#3498db'))
-    fig.add_trace(go.Bar(name=l2, x=top_companies['Company'], y=top_companies[f'{l2} Sales'], marker_color='#2ecc71'))
-    fig.add_trace(go.Bar(name=l3, x=top_companies['Company'], y=top_companies[f'{l3} Sales'], marker_color='#e74c3c'))
+    fig.add_trace(go.Bar(name=f"Prior Year ({comparison_label})",
+                         x=top['Account'], y=top['Prior Year Sales'], marker_color='#3498db'))
+    fig.add_trace(go.Bar(name=f"YTD ({primary_label})",
+                         x=top['Account'], y=top['YTD Sales'], marker_color='#00d4aa'))
 
     fig.update_layout(
-        title='Top 15 Accounts - Period over Period Sales',
+        title='Top 15 Accounts — YTD vs Prior Year',
         barmode='group',
         xaxis_tickangle=-45,
         height=500,
@@ -540,78 +560,61 @@ def create_yoy_chart(df: pd.DataFrame, periods: list):
     return fig
 
 def create_rep_performance_chart(df: pd.DataFrame):
-    """Create sales rep performance chart."""
+    """Sales rep YTD performance chart."""
     import plotly.express as px
-    
-    # Aggregate by rep
-    rep_data = df.groupby('Sales Rep').agg({
-        'Total Sales': 'sum',
-        'Company': 'count'
-    }).reset_index()
-    rep_data.columns = ['Sales Rep', 'Total Sales', 'Account Count']
-    rep_data = rep_data[rep_data['Sales Rep'] != '']  # Remove empty reps
-    rep_data = rep_data.sort_values('Total Sales', ascending=True)
-    
-    fig = px.bar(
-        rep_data,
-        y='Sales Rep',
-        x='Total Sales',
-        orientation='h',
-        title='Sales by Rep (All Time)',
-        color='Total Sales',
-        color_continuous_scale='Blues'
-    )
-    
+
+    rep_data = df.groupby('Sales Rep').agg(
+        YTD_Sales=('YTD Sales', 'sum'),
+        Accounts=('Account', 'count')
+    ).reset_index()
+    rep_data = rep_data[rep_data['Sales Rep'] != ''].sort_values('YTD_Sales', ascending=True)
+
+    fig = px.bar(rep_data, y='Sales Rep', x='YTD_Sales', orientation='h',
+                 title='YTD Sales by Rep', color='YTD_Sales',
+                 color_continuous_scale='Blues',
+                 labels={'YTD_Sales': 'YTD Sales ($)'})
     fig.update_layout(height=400, showlegend=False)
-    
     return fig
 
 def create_tier_breakdown_chart(df: pd.DataFrame):
-    """Create tier breakdown pie chart."""
+    """Tier breakdown by YTD sales."""
     import plotly.express as px
-    
-    tier_data = df.groupby('Tier').agg({
-        'Total Sales': 'sum'
-    }).reset_index()
-    tier_data = tier_data[tier_data['Tier'] != '']  # Remove empty tiers
-    
+
+    tier_data = df.groupby('Tier').agg(YTD_Sales=('YTD Sales', 'sum')).reset_index()
+    tier_data = tier_data[tier_data['Tier'] != '']
     if tier_data.empty:
         return None
-    
-    fig = px.pie(
-        tier_data,
-        values='Total Sales',
-        names='Tier',
-        title='Sales by Tier',
-        color_discrete_sequence=px.colors.qualitative.Set2
-    )
-    
+
+    fig = px.pie(tier_data, values='YTD_Sales', names='Tier',
+                 title='YTD Sales by Tier',
+                 color_discrete_sequence=px.colors.qualitative.Set2)
     fig.update_layout(height=400)
-    
     return fig
 
 def create_growth_scatter(df: pd.DataFrame, periods: list):
-    """Create growth scatter plot."""
+    """YTD vs Prior Year growth scatter."""
     import plotly.express as px
 
-    l2, l3 = periods[1]["label"], periods[2]["label"]
-    growth_df = df[(df[f'{l2} Sales'] > 0) | (df[f'{l3} Sales'] > 0)].copy()
+    primary_label    = periods[-1]["label"] if periods else "YTD"
+    comparison_label = periods[-2]["label"] if len(periods) >= 2 else "Prior Year"
 
-    if growth_df.empty:
+    plot_df = df[(df['YTD Sales'] > 0) | (df['Prior Year Sales'] > 0)].copy()
+    if plot_df.empty:
         return None
 
     fig = px.scatter(
-        growth_df,
-        x=f'{l2} Sales',
-        y=f'{l3} Sales',
-        size='Total Sales',
-        color='Tier' if growth_df['Tier'].any() else None,
-        hover_name='Company',
-        title=f'{l3} vs {l2}',
-        labels={f'{l2} Sales': f'{l2} Sales ($)', f'{l3} Sales': f'{l3} Sales ($)'}
+        plot_df,
+        x='Prior Year Sales', y='YTD Sales',
+        size='YTD Sales',
+        color='Tier' if plot_df['Tier'].any() else None,
+        hover_name='Account',
+        hover_data={'$ Change': True, '% Change': True},
+        title=f'YTD vs Prior Year — Growth Quadrant',
+        labels={'Prior Year Sales': f'Prior Year ({comparison_label}) ($)',
+                'YTD Sales': f'YTD ({primary_label}) ($)'}
     )
 
-    max_val = max(growth_df[f'{l2} Sales'].max(), growth_df[f'{l3} Sales'].max())
+    max_val = max(plot_df['Prior Year Sales'].max(), plot_df['YTD Sales'].max())
     fig.add_shape(type='line', x0=0, y0=0, x1=max_val, y1=max_val,
                   line=dict(color='gray', dash='dash'))
     fig.update_layout(height=500)
@@ -643,11 +646,10 @@ def main():
         cin7_key  = st.text_input("API Key",  value=get_secret("CIN7_API_KEY"), type="password", key="cin7_key")
         
         if cin7_user and cin7_key:
-            ok, msg = test_cin7_connection(cin7_user, cin7_key)
-            if ok:
-                st.success(f"✅ {msg}")
-            else:
-                st.error(f"❌ {msg}")
+            if st.button("Test Cin7", key="test_cin7"):
+                ok, msg = test_cin7_connection(cin7_user, cin7_key)
+                if ok: st.success(f"✅ {msg}")
+                else:  st.error(f"❌ {msg}")
         
         st.divider()
         
@@ -658,11 +660,10 @@ def main():
                                        help="The internal name of your Tier property in HubSpot")
         
         if hubspot_key:
-            ok, msg = test_hubspot_connection(hubspot_key)
-            if ok:
-                st.success(f"✅ {msg}")
-            else:
-                st.error(f"❌ {msg}")
+            if st.button("Test HubSpot", key="test_hs"):
+                ok, msg = test_hubspot_connection(hubspot_key)
+                if ok: st.success(f"✅ {msg}")
+                else:  st.error(f"❌ {msg}")
         
         st.divider()
 
@@ -849,44 +850,34 @@ def main():
                 # Store period config in session state
                 st.session_state.periods = periods
 
-                # Fetch Cin7 orders for each period
-                all_orders = []
+                # Fetch Cin7 orders for ALL periods in parallel
+                progress_text.text("Fetching orders (parallel)...")
+                all_orders = fetch_all_periods_parallel(
+                    cin7_user, cin7_key, periods,
+                    status_placeholder=progress_text
+                )
                 for p in periods:
-                    start_str = p["start"].strftime("%Y-%m-%dT00:00:00Z")
-                    end_str   = p["end"].strftime("%Y-%m-%dT23:59:59Z")
-                    progress_text.text(f"Fetching {p['label']} orders...")
-                    period_orders = fetch_orders_by_date_range(
-                        cin7_user, cin7_key,
-                        start_str, end_str,
-                        label=p["label"],
-                        progress_callback=lambda msg: progress_text.text(msg)
-                    )
-                    all_orders.extend(period_orders)
-                    st.sidebar.info(f"📅 {p['label']}: {len(period_orders)} orders")
-                
+                    count = sum(1 for o in all_orders
+                                if o.get('createdDate','')[:10] >= str(p["start"])
+                                and o.get('createdDate','')[:10] <= str(p["end"]))
+                    st.sidebar.info(f"📅 {p['label']}: ~{count} orders")
+
                 # Aggregate by company
                 progress_text.text("Aggregating by company...")
                 company_data = aggregate_orders_by_company(all_orders, periods)
-                
-                # Fetch HubSpot tiers + owners
-                hubspot_tiers = {}
+
+                # Fetch HubSpot — single call for BOTH tiers and owners
+                hubspot_tiers  = {}
                 company_owners = {}
-                owners_lookup = {}
+                owners_lookup  = {}
                 if hubspot_key:
-                    progress_text.text("Fetching HubSpot tiers...")
-                    hubspot_tiers = fetch_hubspot_companies_with_tier(
+                    progress_text.text("Fetching HubSpot data (1 call)...")
+                    hubspot_tiers, company_owners = fetch_hubspot_company_data(
                         hubspot_key, tier_property,
                         progress_callback=lambda msg: progress_text.text(msg)
                     )
-                    st.sidebar.info(f"🏢 HubSpot: {len(hubspot_tiers)} companies")
-
-                    progress_text.text("Fetching HubSpot owners...")
                     owners_lookup = fetch_hubspot_owners(hubspot_key)
-                    company_owners = fetch_hubspot_company_owners(
-                        hubspot_key,
-                        progress_callback=lambda msg: progress_text.text(msg)
-                    )
-                    st.sidebar.info(f"👤 Owners: {len(owners_lookup)} reps mapped")
+                    st.sidebar.info(f"🏢 HubSpot: {len(hubspot_tiers)} companies, {len(owners_lookup)} reps")
                 
                 # Build report
                 progress_text.text("Building report...")
@@ -906,182 +897,161 @@ def main():
     
     if df is None:
         st.info("👈 Configure your API credentials and click **Generate Report** to get started.")
-        
-        # Show sample of what they'll get
-        st.subheader("📋 Report Preview")
+        st.subheader("📋 What this report shows")
         st.markdown("""
-        This report will show you:
-        
         | Column | Description |
         |--------|-------------|
-        | **Company** | Account/Company name |
-        | **2024 Sales** | Total sales in 2024 |
-        | **2025 Sales** | Total sales in 2025 |
-        | **2026 Sales (YTD)** | Year-to-date sales |
-        | **$ Change** | Dollar change between periods |
-        | **% Change** | Percentage change |
+        | **Account** | Company / account name |
+        | **YTD Sales** | Revenue for your selected primary period |
+        | **Prior Year Sales** | Revenue for the comparison period |
+        | **$ Change** | Dollar difference (YTD vs Prior) |
+        | **% Change** | Percentage growth or decline |
+        | **Tier** | Commission tier from HubSpot |
         | **Sales Rep** | Assigned sales representative |
-        | **Tier** | Customer tier from HubSpot |
         """)
         return
     
     # -------------------------------------------------------------------------
     # FILTERS
     # -------------------------------------------------------------------------
-    st.subheader("🔍 Filters")
-    
-    col1, col2, col3 = st.columns(3)
-    
+    periods = st.session_state.get('periods', [])
+    primary_label    = periods[-1]["label"] if periods else "YTD"
+    comparison_label = periods[-2]["label"] if len(periods) >= 2 else "Prior Year"
+
+    # Period context banner
+    if periods:
+        p = periods[-1]; c = periods[-2] if len(periods) >= 2 else None
+        banner = f"**YTD Sales** = {p['start'].strftime('%b %d, %Y')} → {p['end'].strftime('%b %d, %Y')}"
+        if c:
+            banner += f"  |  **Prior Year Sales** = {c['start'].strftime('%b %d, %Y')} → {c['end'].strftime('%b %d, %Y')}"
+        st.caption(banner)
+
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
-        # Sales Rep filter
         all_reps = ['All'] + sorted([r for r in df['Sales Rep'].unique() if r])
         selected_rep = st.selectbox("Sales Rep", all_reps)
-    
     with col2:
-        # Tier filter
         all_tiers = ['All'] + sorted([t for t in df['Tier'].unique() if t])
         selected_tier = st.selectbox("Tier", all_tiers)
-    
     with col3:
-        # Minimum sales filter
-        min_sales = st.number_input("Minimum Total Sales ($)", min_value=0, value=0, step=1000)
-    
+        min_ytd = st.number_input("Min YTD Sales ($)", min_value=0, value=0, step=500)
+    with col4:
+        sort_by = st.selectbox("Sort By", ["YTD Sales ↓", "Prior Year Sales ↓", "% Change ↓", "% Change ↑", "Account A→Z"])
+
     # Apply filters
     filtered_df = df.copy()
-    if selected_rep != 'All':
-        filtered_df = filtered_df[filtered_df['Sales Rep'] == selected_rep]
-    if selected_tier != 'All':
-        filtered_df = filtered_df[filtered_df['Tier'] == selected_tier]
-    if min_sales > 0:
-        filtered_df = filtered_df[filtered_df['Total Sales'] >= min_sales]
-    
+    if selected_rep  != 'All': filtered_df = filtered_df[filtered_df['Sales Rep'] == selected_rep]
+    if selected_tier != 'All': filtered_df = filtered_df[filtered_df['Tier'] == selected_tier]
+    if min_ytd > 0:            filtered_df = filtered_df[filtered_df['YTD Sales'] >= min_ytd]
+
+    # Apply sort
+    sort_map = {
+        "YTD Sales ↓":        ("YTD Sales",        False),
+        "Prior Year Sales ↓": ("Prior Year Sales",  False),
+        "% Change ↓":         ("% Change",          False),
+        "% Change ↑":         ("% Change",          True),
+        "Account A→Z":        ("Account",           True),
+    }
+    scol, sasc = sort_map[sort_by]
+    filtered_df = filtered_df.sort_values(scol, ascending=sasc).reset_index(drop=True)
+
     # -------------------------------------------------------------------------
     # SUMMARY METRICS
     # -------------------------------------------------------------------------
     st.divider()
 
-    periods = st.session_state.get('periods', [
-        {"label": str(CURRENT_YEAR - 2)}, {"label": str(CURRENT_YEAR - 1)}, {"label": f"{CURRENT_YEAR} YTD"}
-    ])
-    l1, l2, l3 = periods[0]["label"], periods[1]["label"], periods[2]["label"]
+    total_ytd   = filtered_df['YTD Sales'].sum()
+    total_prior = filtered_df['Prior Year Sales'].sum()
+    total_chg_d = filtered_df['$ Change'].sum()
+    total_chg_p = ((total_ytd - total_prior) / total_prior * 100) if total_prior > 0 else 0
+    growing     = (filtered_df['% Change'] > 0).sum()
+    declining   = (filtered_df['% Change'] < 0).sum()
 
-    col1, col2, col3, col4, col5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    with c1: st.metric("Accounts",        f"{len(filtered_df):,}")
+    with c2: st.metric("YTD Sales",        f"${total_ytd:,.0f}")
+    with c3: st.metric("Prior Year Sales", f"${total_prior:,.0f}")
+    with c4: st.metric("$ Change",         f"${total_chg_d:+,.0f}")
+    with c5: st.metric("% Change",         f"{total_chg_p:+.1f}%")
+    with c6:
+        st.metric("Growing / Declining", f"↑{growing}  ↓{declining}")
 
-    with col1:
-        st.metric("📊 Accounts", f"{len(filtered_df):,}")
-
-    with col2:
-        total_s1 = filtered_df[f'{l1} Sales'].sum()
-        st.metric(f"💰 {l1}", f"${total_s1:,.0f}")
-
-    with col3:
-        total_s2 = filtered_df[f'{l2} Sales'].sum()
-        change = ((total_s2 - total_s1) / total_s1 * 100) if total_s1 > 0 else 0
-        st.metric(f"💰 {l2}", f"${total_s2:,.0f}", f"{change:+.1f}%")
-
-    with col4:
-        total_s3 = filtered_df[f'{l3} Sales'].sum()
-        change = ((total_s3 - total_s2) / total_s2 * 100) if total_s2 > 0 else 0
-        st.metric(f"💰 {l3}", f"${total_s3:,.0f}", f"{change:+.1f}% vs {l2}")
-
-    with col5:
-        total_all = filtered_df['Total Sales'].sum()
-        st.metric("💎 Total Sales", f"${total_all:,.0f}")
-    
     # -------------------------------------------------------------------------
-    # TABS: Table | Charts
+    # TABS: Table | Charts | Export
     # -------------------------------------------------------------------------
     st.divider()
-    
-    tab1, tab2, tab3 = st.tabs(["📋 Data Table", "📈 Charts", "📤 Export"])
-    
-    # TAB 1: Data Table
+    tab1, tab2, tab3 = st.tabs(["📋 Account Report", "📈 Charts", "📤 Export"])
+
+    # ------------------------------------------------------------------
+    # TAB 1 — Account Report (exactly the 7 columns)
+    # ------------------------------------------------------------------
     with tab1:
-        st.subheader(f"Sales Report ({len(filtered_df)} accounts)")
-        
-        # Format the dataframe for display
-        display_df = filtered_df.copy()
+        st.subheader(f"Account Performance — {len(filtered_df)} accounts")
 
-        # Format currency columns dynamically
-        currency_cols = [c for c in display_df.columns if 'Sales' in c or '($)' in c or c == 'Total Sales']
-        for col in currency_cols:
-            if col in display_df.columns:
-                display_df[col] = display_df[col].apply(lambda x: f"${x:,.2f}" if isinstance(x, (int, float)) else x)
+        display_df = filtered_df[['Account', 'YTD Sales', 'Prior Year Sales',
+                                   '$ Change', '% Change', 'Tier', 'Sales Rep']].copy()
 
-        pct_cols = [c for c in display_df.columns if '(%)' in c]
-        for col in pct_cols:
-            if col in display_df.columns:
-                display_df[col] = display_df[col].apply(lambda x: f"{x:+.1f}%" if isinstance(x, (int, float)) else x)
-        
-        st.dataframe(
-            display_df,
-            use_container_width=True,
-            hide_index=True,
-            height=600
-        )
-    
-    # TAB 2: Charts
+        # Format for display
+        display_df['YTD Sales']        = display_df['YTD Sales'].apply(lambda x: f"${x:,.2f}")
+        display_df['Prior Year Sales'] = display_df['Prior Year Sales'].apply(lambda x: f"${x:,.2f}")
+        display_df['$ Change']         = display_df['$ Change'].apply(
+            lambda x: f"+${x:,.2f}" if x >= 0 else f"-${abs(x):,.2f}")
+        display_df['% Change']         = display_df['% Change'].apply(lambda x: f"{x:+.1f}%")
+
+        st.dataframe(display_df, use_container_width=True, hide_index=True, height=600)
+
+    # ------------------------------------------------------------------
+    # TAB 2 — Charts
+    # ------------------------------------------------------------------
     with tab2:
         st.subheader("📈 Visual Analytics")
-        
-        # YoY Comparison Chart
         if len(filtered_df) > 0:
             st.plotly_chart(create_yoy_chart(filtered_df, periods), use_container_width=True)
-        
-        # Two column layout for smaller charts
+
         col1, col2 = st.columns(2)
-        
         with col1:
-            # Rep Performance
             if filtered_df['Sales Rep'].any():
                 fig = create_rep_performance_chart(filtered_df)
-                if fig:
-                    st.plotly_chart(fig, use_container_width=True)
-        
+                if fig: st.plotly_chart(fig, use_container_width=True)
         with col2:
-            # Tier Breakdown
             if filtered_df['Tier'].any():
                 fig = create_tier_breakdown_chart(filtered_df)
-                if fig:
-                    st.plotly_chart(fig, use_container_width=True)
-        
-        # Growth Scatter
+                if fig: st.plotly_chart(fig, use_container_width=True)
+
         fig = create_growth_scatter(filtered_df, periods)
         if fig:
             st.plotly_chart(fig, use_container_width=True)
-            st.caption("📍 Companies above the dashed line are growing; below are declining")
-    
-    # TAB 3: Export
+            st.caption("📍 Accounts above the line are growing YTD vs prior year; below are declining")
+
+    # ------------------------------------------------------------------
+    # TAB 3 — Export
+    # ------------------------------------------------------------------
     with tab3:
-        st.subheader("📤 Export Data")
-        
+        st.subheader("📤 Export Report")
+        export_df = filtered_df[['Account', 'YTD Sales', 'Prior Year Sales',
+                                  '$ Change', '% Change', 'Tier', 'Sales Rep']].copy()
+
         col1, col2 = st.columns(2)
-        
         with col1:
-            st.markdown("### Excel Export")
-            st.write(f"Export {len(filtered_df)} accounts to Excel")
-            
-            excel_data = export_to_excel(filtered_df)
+            st.markdown("### Excel")
+            st.write(f"{len(export_df)} accounts")
+            excel_data = export_to_excel(export_df)
             st.download_button(
                 label="⬇️ Download Excel",
                 data=excel_data,
-                file_name=f"orderfloz_sales_report_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                file_name=f"sales_report_{datetime.now().strftime('%Y%m%d')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
-        
         with col2:
-            st.markdown("### CSV Export")
-            st.write(f"Export {len(filtered_df)} accounts to CSV")
-            
-            csv_data = filtered_df.to_csv(index=False)
+            st.markdown("### CSV")
+            st.write(f"{len(export_df)} accounts")
             st.download_button(
                 label="⬇️ Download CSV",
-                data=csv_data,
-                file_name=f"orderfloz_sales_report_{datetime.now().strftime('%Y%m%d')}.csv",
+                data=export_df.to_csv(index=False),
+                file_name=f"sales_report_{datetime.now().strftime('%Y%m%d')}.csv",
                 mime="text/csv"
             )
-    
-    # Footer
+
     st.markdown("---")
     st.markdown(
         f"<p style='text-align: center; color: #666; font-size: 0.8rem;'>Powered by {BRANDING['company_name']} | 📊 Management Reports</p>",
