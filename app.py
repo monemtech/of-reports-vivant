@@ -1027,13 +1027,9 @@ def main():
                 lbl = f"Prev {primary_label}"
                 return (lbl, cs, ce)
 
-        # Resolve the periods
+        # Resolve the periods — primary + comparison only, no auto-inserted 3rd period
         p_label, p_start, p_end = resolve_primary(selected_period)
         comp = resolve_comparison(p_label, p_start, p_end, compare_to)
-
-        # Build periods list: always show prior full year + comparison + primary
-        prior_year = cy - 1
-        prior_year_end = datetime(prior_year, 12, 31).date()
 
         if comp:
             periods = [
@@ -1044,14 +1040,6 @@ def main():
             periods = [
                 {"label": p_label, "start": p_start, "end": p_end},
             ]
-
-        # Always add a 3rd full prior year column for context if we only have 2
-        if len(periods) == 2 and str(prior_year) not in [p["label"] for p in periods]:
-            periods.insert(0, {
-                "label": str(prior_year),
-                "start": datetime(prior_year, 1, 1).date(),
-                "end": prior_year_end
-            })
 
         # Show resolved dates as a preview
         st.caption("**Resolved periods:**")
