@@ -767,6 +767,20 @@ def run_full_fetch(cin7_user: str, cin7_key: str, hubspot_key: str,
         company_data, hs_tiers, periods, hs_owners, hs_lookup,
         cin7_customers=st.session_state.cin7_customers)
 
+    # Store raw debug info to session state so it survives st.rerun()
+    st.session_state["_debug"] = {
+        "total_orders_fetched": len(all_orders),
+        "periods": [p["label"] for p in periods],
+        "first_order": all_orders[0] if all_orders else None,
+        "audit_total_raw": audit.get("total_raw", 0),
+        "audit_excluded_source": audit.get("excluded_source", 0),
+        "audit_excluded_domain": audit.get("excluded_domain", 0),
+        "audit_excluded_no_period": audit.get("excluded_no_period", 0),
+        "audit_zero_total": audit.get("excluded_zero_total", 0),
+        "source_values_seen": audit.get("excluded_sources", {}),
+        "fetch_warnings": fetch_warnings,
+    }
+
     return {"df": df, "audit": audit, "hubspot_tiers": hs_tiers, "all_orders": all_orders}
 
 # =============================================================================
@@ -1136,6 +1150,12 @@ def main():
         df = None
 
     if df is None:
+        debug = st.session_state.get("_debug")
+        if debug:
+            st.subheader("🐛 Debug — Last Fetch Results")
+            st.json(debug)
+            st.divider()
+
         audit = st.session_state.get("audit")
         if audit and audit.get("total_raw", 0) > 0:
             st.warning("Report returned no qualifying wholesale rows. See breakdown below.")
