@@ -1223,19 +1223,19 @@ def main():
                 # ── Step 1: probe all periods simultaneously ───────────────
                 progress_text.text("Checking for updates...")
 
-                def probe_period(p):
+                def probe_period(p, username, api_key):
                     start_str = p["start"].strftime("%Y-%m-%dT00:00:00Z")
                     end_str   = p["end"].strftime("%Y-%m-%dT23:59:59Z")
                     is_closed = p["end"] < today
                     if is_closed:
                         fp = "CLOSED"
                     else:
-                        fp = probe_cin7_fingerprint(cin7_user, cin7_key, start_str, end_str)
+                        fp = probe_cin7_fingerprint(username, api_key, start_str, end_str)
                     return p, start_str, end_str, fp
 
                 probed = []
                 with ThreadPoolExecutor(max_workers=4) as ex:
-                    futs = [ex.submit(probe_period, p) for p in periods]
+                    futs = [ex.submit(probe_period, p, cin7_user, cin7_key) for p in periods]
                     for f in as_completed(futs):
                         probed.append(f.result())
 
@@ -1253,25 +1253,24 @@ def main():
                 # ── Step 3: full fetch + HubSpot all in parallel ───────────
                 hubspot_result = [None, None, {}]  # [tiers, owners, lookup]
 
-                def full_fetch(p, start_str, end_str, fp):
+                def full_fetch(p, start_str, end_str, fp, username, api_key):
                     orders = fetch_orders_by_date_range(
-                        cin7_user, cin7_key, start_str, end_str, label=p["label"])
+                        username, api_key, start_str, end_str, label=p["label"])
                     cache_save_orders(p["label"], orders, fp)
                     return p["label"], orders
 
-                def fetch_hubspot():
+                def fetch_hubspot(api_key, tier_prop):
                     tiers, owners = cache_load_hubspot()
                     if tiers is not None:
-                        lookup = fetch_hubspot_owners(hubspot_key)
+                        lookup = fetch_hubspot_owners(api_key)
                         return tiers, owners, lookup, True
-                    tiers, owners = fetch_hubspot_company_data(
-                        hubspot_key, tier_property)
-                    lookup = fetch_hubspot_owners(hubspot_key)
+                    tiers, owners = fetch_hubspot_company_data(api_key, tier_prop)
+                    lookup = fetch_hubspot_owners(api_key)
                     cache_save_hubspot(tiers, owners)
                     return tiers, owners, lookup, False
 
-                def fetch_customers():
-                    return fetch_cin7_customers(cin7_user, cin7_key)
+                def fetch_customers(username, api_key):
+                    return fetch_cin7_customers(username, api_key)
 
                 if needs_fetch or hubspot_key:
                     if needs_fetch:
@@ -1283,12 +1282,12 @@ def main():
                     tasks = {}
                     with ThreadPoolExecutor(max_workers=6) as ex:
                         for args in needs_fetch:
-                            fut = ex.submit(full_fetch, *args)
+                            fut = ex.submit(full_fetch, *args, cin7_user, cin7_key)
                             tasks[fut] = "cin7"
                         if hubspot_key:
-                            hs_fut = ex.submit(fetch_hubspot)
+                            hs_fut = ex.submit(fetch_hubspot, hubspot_key, tier_property)
                             tasks[hs_fut] = "hubspot"
-                        cust_fut = ex.submit(fetch_customers)
+                        cust_fut = ex.submit(fetch_customers, cin7_user, cin7_key)
                         tasks[cust_fut] = "customers"
 
                         for fut in as_completed(tasks):
