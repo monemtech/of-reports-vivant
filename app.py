@@ -261,7 +261,10 @@ def _fetch_page(username: str, api_key: str, start: str, end: str,
     """Fetch a single page. Returns (orders_list, hit_end).
     hit_end=True means this was the last page."""
     params = {
-        "where": f"createdDate >= '{start}' AND createdDate <= '{end}'",
+        # DEBUG: removed date filter to test if API returns anything
+        # "where": f"createdDate >= '{start}' AND createdDate <= '{end}'",
+        "createdDateFrom": start,
+        "createdDateTo":   end,
         "page":  page,
         "rows":  PAGE_SIZE,
     }
@@ -348,7 +351,8 @@ def probe_cin7_fingerprint(username: str, api_key: str,
             "https://api.cin7.com/api/v1/SalesOrders",
             auth=(username, api_key),
             params={
-                "where":  f"createdDate >= '{start_date}' AND createdDate <= '{end_date}'",
+                "createdDateFrom": start_date,
+                "createdDateTo":   end_date,
                 "rows":   1,
                 "order":  "modifiedDate desc",
                 "fields": "id,modifiedDate",
