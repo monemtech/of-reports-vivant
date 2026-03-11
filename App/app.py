@@ -1114,6 +1114,10 @@ def main():
                 st.session_state.report_data = None
                 st.rerun()
 
+        st.divider()
+
+        can_generate = bool(cin7_user and cin7_key)
+
         if st.button("🔄 Generate Report", type="primary",
                      use_container_width=True, disabled=not can_generate):
             with st.spinner("Checking for updates..."):
@@ -1127,69 +1131,86 @@ def main():
                 cache_hits   = 0
                 cache_misses = 0
 
-                # ── Per-period: probe → cache check → fetch if needed ──────
-                for p in periods:
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+
+                # ── Step 1: probe all periods simultaneously ───────────────
+                progress_text.text("Checking for updates...")
+
+                def probe_period(p):
                     start_str = p["start"].strftime("%Y-%m-%dT00:00:00Z")
                     end_str   = p["end"].strftime("%Y-%m-%dT23:59:59Z")
-                    label     = p["label"]
-
-                    # Closed period = end date is in the past; data is immutable
                     is_closed = p["end"] < today
-
                     if is_closed:
-                        # Try cache first — no probe needed for closed periods
-                        cached = cache_load_orders(label, "CLOSED")
-                        if cached is not None:
-                            all_orders.extend(cached)
-                            cache_hits += 1
-                            st.sidebar.success(f"✅ {label}: {len(cached)} orders (cached)")
-                            continue
+                        fp = "CLOSED"
+                    else:
+                        fp = probe_cin7_fingerprint(cin7_user, cin7_key, start_str, end_str)
+                    return p, start_str, end_str, fp
 
-                    # Open (or no cache) → probe for fingerprint
-                    progress_text.text(f"Checking {label} for changes...")
-                    fingerprint = probe_cin7_fingerprint(
-                        cin7_user, cin7_key, start_str, end_str)
+                probed = []
+                with ThreadPoolExecutor(max_workers=4) as ex:
+                    futs = [ex.submit(probe_period, p) for p in periods]
+                    for f in as_completed(futs):
+                        probed.append(f.result())
 
-                    cached = cache_load_orders(label, fingerprint)
+                # ── Step 2: determine what needs a full fetch ──────────────
+                needs_fetch = []
+                for p, start_str, end_str, fp in probed:
+                    cached = cache_load_orders(p["label"], fp)
                     if cached is not None:
                         all_orders.extend(cached)
                         cache_hits += 1
-                        st.sidebar.success(f"✅ {label}: {len(cached)} orders (cached)")
                     else:
-                        # Full fetch needed
                         cache_misses += 1
-                        progress_text.text(f"Downloading {label} orders...")
-                        period_orders = fetch_orders_by_date_range(
-                            cin7_user, cin7_key, start_str, end_str, label=label,
-                            progress_callback=lambda msg: progress_text.text(msg)
-                        )
-                        cache_save_orders(label, period_orders,
-                                          "CLOSED" if is_closed else fingerprint)
-                        all_orders.extend(period_orders)
-                        st.sidebar.info(f"🔄 {label}: {len(period_orders)} orders (fresh)")
+                        needs_fetch.append((p, start_str, end_str, fp))
 
-                # ── HubSpot: TTL cache ──────────────────────────────────────
-                hubspot_tiers, company_owners = cache_load_hubspot()
-                owners_lookup = {}
+                # ── Step 3: full fetch + HubSpot all in parallel ───────────
+                hubspot_result = [None, None, {}]  # [tiers, owners, lookup]
 
-                if hubspot_key:
-                    if hubspot_tiers is not None:
-                        st.sidebar.success(
-                            f"✅ HubSpot: {len(hubspot_tiers)} companies (cached)")
-                        owners_lookup = fetch_hubspot_owners(hubspot_key)
+                def full_fetch(p, start_str, end_str, fp):
+                    orders = fetch_orders_by_date_range(
+                        cin7_user, cin7_key, start_str, end_str, label=p["label"])
+                    cache_save_orders(p["label"], orders, fp)
+                    return p["label"], orders
+
+                def fetch_hubspot():
+                    tiers, owners = cache_load_hubspot()
+                    if tiers is not None:
+                        lookup = fetch_hubspot_owners(hubspot_key)
+                        return tiers, owners, lookup, True
+                    tiers, owners = fetch_hubspot_company_data(
+                        hubspot_key, tier_property)
+                    lookup = fetch_hubspot_owners(hubspot_key)
+                    cache_save_hubspot(tiers, owners)
+                    return tiers, owners, lookup, False
+
+                if needs_fetch or hubspot_key:
+                    if needs_fetch:
+                        progress_text.text(
+                            f"Downloading {len(needs_fetch)} period(s) + HubSpot in parallel...")
                     else:
-                        progress_text.text("Fetching HubSpot data...")
-                        hubspot_tiers, company_owners = fetch_hubspot_company_data(
-                            hubspot_key, tier_property,
-                            progress_callback=lambda msg: progress_text.text(msg)
-                        )
-                        owners_lookup = fetch_hubspot_owners(hubspot_key)
-                        cache_save_hubspot(hubspot_tiers, company_owners)
-                        st.sidebar.info(
-                            f"🔄 HubSpot: {len(hubspot_tiers)} companies (fresh)")
-                else:
-                    hubspot_tiers  = {}
-                    company_owners = {}
+                        progress_text.text("Refreshing HubSpot data...")
+
+                    tasks = {}
+                    with ThreadPoolExecutor(max_workers=5) as ex:
+                        for args in needs_fetch:
+                            fut = ex.submit(full_fetch, *args)
+                            tasks[fut] = "cin7"
+                        if hubspot_key:
+                            hs_fut = ex.submit(fetch_hubspot)
+                            tasks[hs_fut] = "hubspot"
+
+                        for fut in as_completed(tasks):
+                            kind = tasks[fut]
+                            if kind == "cin7":
+                                lbl, orders = fut.result()
+                                all_orders.extend(orders)
+                            else:
+                                tiers, owners, lookup, from_cache = fut.result()
+                                hubspot_result = [tiers, owners, lookup]
+
+                hubspot_tiers  = hubspot_result[0] or {}
+                company_owners = hubspot_result[1] or {}
+                owners_lookup  = hubspot_result[2] or {}
 
                 # ── Build report ────────────────────────────────────────────
                 progress_text.text("Building report...")
@@ -1256,8 +1277,11 @@ def main():
         min_ytd = st.number_input(f"Min {primary_col} ($)", min_value=0, value=0, step=500)
     with col4:
         sort_by = st.selectbox("Sort By", [
-            f"{primary_col} ↓", f"{comparison_col} ↓",
-            "% Change ↓", "% Change ↑", "Account A→Z"
+            f"{primary_col} ↓", f"{primary_col} ↑",
+            f"{comparison_col} ↓", f"{comparison_col} ↑",
+            "$ Change ↓", "$ Change ↑",
+            "% Change ↓", "% Change ↑",
+            "Account A→Z"
         ])
 
     # Apply filters
@@ -1271,7 +1295,11 @@ def main():
 
     sort_map = {
         f"{primary_col} ↓":    (primary_col,    False),
+        f"{primary_col} ↑":    (primary_col,    True),
         f"{comparison_col} ↓": (comparison_col, False),
+        f"{comparison_col} ↑": (comparison_col, True),
+        "$ Change ↓":          ("$ Change",     False),
+        "$ Change ↑":          ("$ Change",     True),
         "% Change ↓":          ("% Change",     False),
         "% Change ↑":          ("% Change",     True),
         "Account A→Z":         ("Account",      True),
@@ -1330,19 +1358,24 @@ def main():
             )
         st.caption(f"{len(filtered_df)} accounts")
 
-        # ── Build display rows ────────────────────────────────────────
+        # ── Build display table — keep numeric, use column_config for formatting ──
         display_cols = ['Account', primary_col, comparison_col, '$ Change', '% Change', 'Tier', 'Sales Rep']
         display_cols = [c for c in display_cols if c in filtered_df.columns]
         display_df   = filtered_df[display_cols].copy()
 
-        display_df[primary_col]    = display_df[primary_col].apply(lambda x: f"${x:,.2f}")
+        col_cfg = {
+            "Account":    st.column_config.TextColumn("Account", width="medium"),
+            primary_col:  st.column_config.NumberColumn(primary_col,    format="$%.2f", width="small"),
+            "$ Change":   st.column_config.NumberColumn("$ Change",     format="$%.2f", width="small"),
+            "% Change":   st.column_config.NumberColumn("% Change",     format="%.1f%%", width="small"),
+            "Tier":       st.column_config.TextColumn("Tier",           width="small"),
+            "Sales Rep":  st.column_config.TextColumn("Sales Rep",      width="small"),
+        }
         if comparison_col in display_df.columns:
-            display_df[comparison_col] = display_df[comparison_col].apply(lambda x: f"${x:,.2f}")
-        display_df['$ Change']     = display_df['$ Change'].apply(
-            lambda x: f"+${x:,.2f}" if x >= 0 else f"-${abs(x):,.2f}")
-        display_df['% Change']     = display_df['% Change'].apply(lambda x: f"{x:+.1f}%")
+            col_cfg[comparison_col] = st.column_config.NumberColumn(comparison_col, format="$%.2f", width="small")
 
         st.dataframe(display_df, use_container_width=True, hide_index=True,
+                     column_config=col_cfg,
                      height=min(600, (len(display_df) + 1) * 35 + 38))
 
     # ------------------------------------------------------------------
