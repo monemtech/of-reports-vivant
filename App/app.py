@@ -224,6 +224,10 @@ if 'audit' not in st.session_state:
     st.session_state.audit = None
 if 'config_loaded' not in st.session_state:
     st.session_state.config_loaded = load_config()
+if 'cin7_staff' not in st.session_state:
+    st.session_state.cin7_staff = {}
+if 'cin7_customers' not in st.session_state:
+    st.session_state.cin7_customers = {}
 
 # Auto-remove any zero-order cache entries from prior broken runs
 cache_purge_empty_entries()
@@ -249,8 +253,86 @@ def test_cin7_connection(username: str, api_key: str) -> tuple:
     except Exception as e:
         return False, str(e)
 
-def probe_cin7_fingerprint(username: str, api_key: str,
-                           start_date: str, end_date: str) -> str:
+def fetch_cin7_staff(username: str, api_key: str) -> dict:
+    """
+    Fetch all Cin7 staff/users and return a dict of {id: "First Last"}.
+    Used to map salesPersonId → rep name on orders.
+    Cached in session state for the lifetime of the session.
+    """
+    if 'cin7_staff' in st.session_state and st.session_state.cin7_staff:
+        return st.session_state.cin7_staff
+
+    staff = {}
+    try:
+        r = requests.get(
+            "https://api.cin7.com/api/v1/Users",
+            auth=(username, api_key),
+            timeout=15
+        )
+        if r.status_code == 200:
+            for user in r.json():
+                uid  = user.get('id') or user.get('userId')
+                name = f"{user.get('firstName','').strip()} {user.get('lastName','').strip()}".strip()
+                if uid and name:
+                    staff[uid] = name
+    except Exception:
+        pass
+
+    st.session_state.cin7_staff = staff
+    return staff
+
+def fetch_cin7_customers(username: str, api_key: str,
+                         progress_callback=None) -> dict:
+    """
+    Fetch all Cin7 customers and return a dict keyed by UPPERCASE company name:
+      { "COMPANY NAME": { "rep": "First Last", "type": "10%" } }
+    Sales Rep comes from the customer's salesRepresentative field.
+    Type comes from customFields (the CRM custom field named 'Type').
+    Cached in session state for the lifetime of the session.
+    """
+    if 'cin7_customers' in st.session_state and st.session_state.cin7_customers:
+        return st.session_state.cin7_customers
+
+    customers = {}
+    page = 1
+    fields = "id,name,salesRepresentative,customFields"
+
+    while True:
+        if progress_callback:
+            progress_callback(f"Fetching Cin7 customers... page {page}")
+        try:
+            r = requests.get(
+                "https://api.cin7.com/api/v1/Customers",
+                auth=(username, api_key),
+                params={"page": page, "rows": 250, "fields": fields},
+                timeout=30
+            )
+            if r.status_code != 200:
+                break
+            data = r.json()
+            if not data:
+                break
+            for c in data:
+                name = (c.get('name') or '').strip().upper()
+                if not name:
+                    continue
+                rep  = (c.get('salesRepresentative') or '').strip()
+                # Type lives in customFields dict — key may vary, find case-insensitively
+                cf   = c.get('customFields') or {}
+                ctype = ''
+                for k, v in cf.items():
+                    if k.lower() == 'type':
+                        ctype = str(v).strip() if v else ''
+                        break
+                customers[name] = {'rep': rep, 'type': ctype}
+            if len(data) < 250:
+                break
+            page += 1
+        except Exception:
+            break
+
+    st.session_state.cin7_customers = customers
+    return customers
     """
     Fetch ONE order (latest modified) for a date range to get a change fingerprint.
     Returns "id:modifiedDate" string.  Fast — single API call, 1 row.
@@ -278,7 +360,7 @@ def probe_cin7_fingerprint(username: str, api_key: str,
 
 # Only fetch the fields we actually use — cuts payload by ~85%
 # NOTE: if Cin7 rejects the fields param, we fall back to full fetch automatically
-CIN7_FIELDS = "id,company,billingCompany,firstName,lastName,email,total,createdDate,modifiedDate,salesPersonEmail,source"
+CIN7_FIELDS = "id,company,billingCompany,firstName,lastName,email,total,createdDate,modifiedDate,salesPersonId,source"
 
 def fetch_orders_by_date_range(username: str, api_key: str,
                                start_date: str, end_date: str,
@@ -360,7 +442,8 @@ def fetch_all_periods_parallel(username: str, api_key: str, periods: list,
     for p in periods:
         all_orders.extend(results.get(p["label"], []))
     return all_orders
-def aggregate_orders_by_company(orders: list, periods: list) -> tuple:
+def aggregate_orders_by_company(orders: list, periods: list,
+                                cin7_staff: dict = None) -> tuple:
     """
     Aggregate orders by company name across dynamic periods.
     Excludes:
@@ -414,7 +497,8 @@ def aggregate_orders_by_company(orders: list, periods: list) -> tuple:
                 audit["unknown_company"] += 1
 
         total        = float(order.get('total') or 0)
-        rep_email    = (order.get('salesPersonEmail') or '').strip()
+        sp_id        = order.get('salesPersonId')
+        rep_name     = (cin7_staff or {}).get(sp_id, '') if sp_id else ''
         cust_email   = (order.get('email') or '').strip()
         created_date = order.get('createdDate', '')
         period_label = get_period_label(created_date)
@@ -455,14 +539,14 @@ def aggregate_orders_by_company(orders: list, periods: list) -> tuple:
             audit["excluded_zero_total"] += 1
 
         if company not in company_data:
-            company_data[company] = {'rep': rep_email, 'order_count': 0}
+            company_data[company] = {'rep': rep_name, 'order_count': 0}
             for lbl in period_labels:
                 company_data[company][lbl] = 0.0
 
         company_data[company][period_label] += total
         company_data[company]['order_count'] += 1
-        if rep_email and not company_data[company]['rep']:
-            company_data[company]['rep'] = rep_email
+        if rep_name and not company_data[company]['rep']:
+            company_data[company]['rep'] = rep_name
 
         audit["included"] += 1
         audit["by_period"][period_label]["included"] += 1
@@ -649,11 +733,12 @@ def fetch_hubspot_company_data(api_key: str, tier_property: str = "commission_ti
 # DATA PROCESSING
 # =============================================================================
 def build_report_dataframe(company_data: dict, hubspot_tiers: dict, periods: list,
-                           company_owners: dict = None, owners_lookup: dict = None) -> pd.DataFrame:
+                           company_owners: dict = None, owners_lookup: dict = None,
+                           cin7_customers: dict = None) -> pd.DataFrame:
     """
     Build the management report DataFrame.
-    Column names are derived directly from the selected period labels so
-    'YTD Sales' / 'Prior Year Sales' always reflect what was actually selected.
+    Sales Rep and Type come from Cin7 Customers (authoritative source).
+    Tier comes from HubSpot. HubSpot owner is fallback for rep only.
     """
     rows = []
 
@@ -661,7 +746,6 @@ def build_report_dataframe(company_data: dict, hubspot_tiers: dict, periods: lis
     primary_label    = labels[-1]
     comparison_label = labels[-2] if len(labels) >= 2 else None
 
-    # Column names shown in the table — derived from real period labels
     primary_col    = primary_label
     comparison_col = comparison_label if comparison_label else "Comparison"
 
@@ -672,16 +756,17 @@ def build_report_dataframe(company_data: dict, hubspot_tiers: dict, periods: lis
         if primary_sales == 0 and comparison_sales == 0:
             continue
 
+        # Tier from HubSpot
         tier = hubspot_tiers.get(company.upper(), '')
 
-        cin7_rep = data.get('rep', '')
-        if cin7_rep:
-            rep = cin7_rep
-        elif company_owners and owners_lookup:
+        # Sales Rep + Type: Cin7 customer record is authoritative
+        cin7_cust = (cin7_customers or {}).get(company.upper(), {})
+        rep  = cin7_cust.get('rep', '') or data.get('rep', '')
+        # HubSpot owner fallback if no Cin7 rep
+        if not rep and company_owners and owners_lookup:
             owner_id = company_owners.get(company.upper(), '')
             rep = owners_lookup.get(owner_id, '') if owner_id else ''
-        else:
-            rep = ''
+        ctype = cin7_cust.get('type', '')
 
         if comparison_sales > 0:
             change_pct = ((primary_sales - comparison_sales) / comparison_sales) * 100
@@ -697,6 +782,7 @@ def build_report_dataframe(company_data: dict, hubspot_tiers: dict, periods: lis
             comparison_col:     comparison_sales,
             '$ Change':         change_dollars,
             '% Change':         change_pct,
+            'Type':             ctype,
             'Tier':             tier,
             'Sales Rep':        rep,
             '_order_count':     data.get('order_count', 0),
@@ -1183,6 +1269,9 @@ def main():
                     cache_save_hubspot(tiers, owners)
                     return tiers, owners, lookup, False
 
+                def fetch_customers():
+                    return fetch_cin7_customers(cin7_user, cin7_key)
+
                 if needs_fetch or hubspot_key:
                     if needs_fetch:
                         progress_text.text(
@@ -1191,22 +1280,26 @@ def main():
                         progress_text.text("Refreshing HubSpot data...")
 
                     tasks = {}
-                    with ThreadPoolExecutor(max_workers=5) as ex:
+                    with ThreadPoolExecutor(max_workers=6) as ex:
                         for args in needs_fetch:
                             fut = ex.submit(full_fetch, *args)
                             tasks[fut] = "cin7"
                         if hubspot_key:
                             hs_fut = ex.submit(fetch_hubspot)
                             tasks[hs_fut] = "hubspot"
+                        cust_fut = ex.submit(fetch_customers)
+                        tasks[cust_fut] = "customers"
 
                         for fut in as_completed(tasks):
                             kind = tasks[fut]
                             if kind == "cin7":
                                 lbl, orders = fut.result()
                                 all_orders.extend(orders)
-                            else:
+                            elif kind == "hubspot":
                                 tiers, owners, lookup, from_cache = fut.result()
                                 hubspot_result = [tiers, owners, lookup]
+                            elif kind == "customers":
+                                st.session_state.cin7_customers = fut.result()
 
                 hubspot_tiers  = hubspot_result[0] or {}
                 company_owners = hubspot_result[1] or {}
@@ -1214,9 +1307,12 @@ def main():
 
                 # ── Build report ────────────────────────────────────────────
                 progress_text.text("Building report...")
-                company_data, audit = aggregate_orders_by_company(all_orders, periods)
+                cin7_staff   = fetch_cin7_staff(cin7_user, cin7_key)
+                company_data, audit = aggregate_orders_by_company(
+                    all_orders, periods, cin7_staff=cin7_staff)
                 df = build_report_dataframe(
-                    company_data, hubspot_tiers, periods, company_owners, owners_lookup)
+                    company_data, hubspot_tiers, periods, company_owners, owners_lookup,
+                    cin7_customers=st.session_state.cin7_customers)
 
                 st.session_state.report_data             = df
                 st.session_state.cin7_orders_cache       = all_orders
@@ -1264,7 +1360,7 @@ def main():
     # -------------------------------------------------------------------------
     periods = st.session_state.get('periods', [])
 
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
         all_reps = ['All'] + sorted([r for r in df['Sales Rep'].unique() if r])
         selected_rep = st.selectbox("Sales Rep", all_reps)
@@ -1274,8 +1370,13 @@ def main():
         tier_options   = ['All'] + assigned_tiers + (['(No Tier)'] if has_untiered else [])
         selected_tier  = st.selectbox("Tier", tier_options)
     with col3:
-        min_ytd = st.number_input(f"Min {primary_col} ($)", min_value=0, value=0, step=500)
+        type_vals     = sorted([t for t in df['Type'].unique() if t]) if 'Type' in df.columns else []
+        has_no_type   = df['Type'].eq('').any() or df['Type'].isna().any() if 'Type' in df.columns else False
+        type_options  = ['All'] + type_vals + (['(No Type)'] if has_no_type else [])
+        selected_type = st.selectbox("Type", type_options)
     with col4:
+        min_ytd = st.number_input(f"Min {primary_col} ($)", min_value=0, value=0, step=500)
+    with col5:
         sort_by = st.selectbox("Sort By", [
             f"{primary_col} ↓", f"{primary_col} ↑",
             f"{comparison_col} ↓", f"{comparison_col} ↑",
@@ -1291,6 +1392,11 @@ def main():
         filtered_df = filtered_df[filtered_df['Tier'].eq('') | filtered_df['Tier'].isna()]
     elif selected_tier != 'All':
         filtered_df = filtered_df[filtered_df['Tier'] == selected_tier]
+    if 'Type' in filtered_df.columns:
+        if selected_type == '(No Type)':
+            filtered_df = filtered_df[filtered_df['Type'].eq('') | filtered_df['Type'].isna()]
+        elif selected_type != 'All':
+            filtered_df = filtered_df[filtered_df['Type'] == selected_type]
     if min_ytd > 0: filtered_df = filtered_df[filtered_df[primary_col] >= min_ytd]
 
     sort_map = {
@@ -1359,17 +1465,18 @@ def main():
         st.caption(f"{len(filtered_df)} accounts")
 
         # ── Build display table — keep numeric, use column_config for formatting ──
-        display_cols = ['Account', primary_col, comparison_col, '$ Change', '% Change', 'Tier', 'Sales Rep']
+        display_cols = ['Account', primary_col, comparison_col, '$ Change', '% Change', 'Type', 'Tier', 'Sales Rep']
         display_cols = [c for c in display_cols if c in filtered_df.columns]
         display_df   = filtered_df[display_cols].copy()
 
         col_cfg = {
-            "Account":    st.column_config.TextColumn("Account", width="medium"),
-            primary_col:  st.column_config.NumberColumn(primary_col,    format="$%.2f", width="small"),
-            "$ Change":   st.column_config.NumberColumn("$ Change",     format="$%.2f", width="small"),
-            "% Change":   st.column_config.NumberColumn("% Change",     format="%.1f%%", width="small"),
-            "Tier":       st.column_config.TextColumn("Tier",           width="small"),
-            "Sales Rep":  st.column_config.TextColumn("Sales Rep",      width="small"),
+            "Account":    st.column_config.TextColumn("Account",      width="medium"),
+            primary_col:  st.column_config.NumberColumn(primary_col,  format="$%.2f", width="small"),
+            "$ Change":   st.column_config.NumberColumn("$ Change",   format="$%.2f", width="small"),
+            "% Change":   st.column_config.NumberColumn("% Change",   format="%.1f%%", width="small"),
+            "Type":       st.column_config.TextColumn("Type",         width="small"),
+            "Tier":       st.column_config.TextColumn("Tier",         width="small"),
+            "Sales Rep":  st.column_config.TextColumn("Sales Rep",    width="small"),
         }
         if comparison_col in display_df.columns:
             col_cfg[comparison_col] = st.column_config.NumberColumn(comparison_col, format="$%.2f", width="small")
@@ -1406,7 +1513,7 @@ def main():
     # ------------------------------------------------------------------
     with tab3:
         st.subheader("📤 Export Report")
-        export_cols = ['Account', primary_col, comparison_col, '$ Change', '% Change', 'Tier', 'Sales Rep']
+        export_cols = ['Account', primary_col, comparison_col, '$ Change', '% Change', 'Type', 'Tier', 'Sales Rep']
         export_cols = [c for c in export_cols if c in filtered_df.columns]
         export_df   = filtered_df[export_cols].copy()
 
