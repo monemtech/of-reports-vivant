@@ -284,10 +284,10 @@ def fetch_cin7_staff(username: str, api_key: str) -> dict:
 def fetch_cin7_customers(username: str, api_key: str,
                          progress_callback=None) -> dict:
     """
-    Fetch all Cin7 customers and return a dict keyed by UPPERCASE company name:
+    Fetch all Cin7 contacts and return a dict keyed by UPPERCASE company name:
       { "COMPANY NAME": { "rep": "First Last", "type": "10%" } }
-    Sales Rep comes from the customer's salesRepresentative field.
-    Type comes from customFields (the CRM custom field named 'Type').
+    Sales Rep comes from salesRepresentative field.
+    Type comes from customFields['Members_1037'] (Cin7 confirmed field key).
     Cached in session state for the lifetime of the session.
     """
     if 'cin7_customers' in st.session_state and st.session_state.cin7_customers:
@@ -299,10 +299,10 @@ def fetch_cin7_customers(username: str, api_key: str,
 
     while True:
         if progress_callback:
-            progress_callback(f"Fetching Cin7 customers... page {page}")
+            progress_callback(f"Fetching Cin7 contacts... page {page}")
         try:
             r = requests.get(
-                "https://api.cin7.com/api/v1/Customers",
+                "https://api.cin7.com/api/v1/Contacts",
                 auth=(username, api_key),
                 params={"page": page, "rows": 250, "fields": fields},
                 timeout=30
@@ -316,12 +316,12 @@ def fetch_cin7_customers(username: str, api_key: str,
                 name = (c.get('name') or '').strip().upper()
                 if not name:
                     continue
-                rep  = (c.get('salesRepresentative') or '').strip()
-                # Type lives in customFields dict — key may vary, find case-insensitively
-                cf   = c.get('customFields') or {}
+                rep = (c.get('salesRepresentative') or '').strip()
+                cf  = c.get('customFields') or {}
+                # Cin7 confirmed key is Members_1037 — also check 'type' as fallback
                 ctype = ''
                 for k, v in cf.items():
-                    if k.lower() == 'type':
+                    if k == 'Members_1037' or k.lower() == 'type':
                         ctype = str(v).strip() if v else ''
                         break
                 customers[name] = {'rep': rep, 'type': ctype}
