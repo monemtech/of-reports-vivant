@@ -37,7 +37,7 @@ CONTACTS_TTL_HOURS = 12      # Cin7 contacts (reps/types) change infrequently
 ORDERS_TTL_MINUTES = 15      # Open periods: re-check fingerprint every 15 min
 
 # Cin7 limits: 500 rows/page is the max — use it
-PAGE_SIZE   = 500
+PAGE_SIZE   = 250
 # Cin7 rate limit: 3 req/sec — keep batch small
 PAGE_BATCH  = 2
 
