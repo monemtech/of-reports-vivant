@@ -1136,19 +1136,35 @@ def main():
         df = None
 
     if df is None:
-        st.info("👈 Configure your API credentials and click **Generate Report** to begin.")
-        st.markdown("""
-        | Column | Description |
-        |---|---|
-        | **Account** | Company / account name |
-        | **YTD Sales** | Revenue for selected primary period |
-        | **Prior Year** | Revenue for comparison period |
-        | **$ Change** | Dollar difference |
-        | **% Change** | Growth / decline % |
-        | **Type** | Account type from Cin7 (6%, 10%, HA) |
-        | **Tier** | Commission tier from HubSpot |
-        | **Sales Rep** | Assigned rep from Cin7 Contacts |
-        """)
+        audit = st.session_state.get("audit")
+        if audit and audit.get("total_raw", 0) > 0:
+            st.warning("Report returned no qualifying wholesale rows. See breakdown below.")
+            total = audit["total_raw"]
+            st.write(f"**Raw orders from Cin7:** {total:,}")
+            st.write(f"**Excluded Shopify/Retail:** {audit['excluded_source']:,}")
+            st.write(f"**Excluded domain:** {audit.get('excluded_domain', 0):,}")
+            st.write(f"**Outside date range:** {audit['excluded_no_period']:,}")
+            st.write(f"**$0 total:** {audit['excluded_zero_total']:,}")
+            st.write(f"**No company name:** {audit['unknown_company']:,}")
+            if audit.get("excluded_sources"):
+                st.write("**Source values seen:**", audit["excluded_sources"])
+            if audit.get("sample_excluded"):
+                st.write("**Sample excluded orders:**")
+                st.dataframe(pd.DataFrame(audit["sample_excluded"]), use_container_width=True)
+        else:
+            st.info("👈 Configure your API credentials and click **Generate Report** to begin.")
+            st.markdown("""
+            | Column | Description |
+            |---|---|
+            | **Account** | Company / account name |
+            | **YTD Sales** | Revenue for selected primary period |
+            | **Prior Year** | Revenue for comparison period |
+            | **$ Change** | Dollar difference |
+            | **% Change** | Growth / decline % |
+            | **Type** | Account type from Cin7 (6%, 10%, HA) |
+            | **Tier** | Commission tier from HubSpot |
+            | **Sales Rep** | Assigned rep from Cin7 Contacts |
+            """)
         return
 
     primary_col = df["_primary_col"].iloc[0]
