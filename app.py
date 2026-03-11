@@ -261,8 +261,6 @@ def _fetch_page(username: str, api_key: str, start: str, end: str,
     """Fetch a single page. Returns (orders_list, hit_end).
     hit_end=True means this was the last page."""
     params = {
-        # DEBUG: removed date filter to test if API returns anything
-        # "where": f"createdDate >= '{start}' AND createdDate <= '{end}'",
         "createdDateFrom": start,
         "createdDateTo":   end,
         "page":  page,
@@ -270,6 +268,44 @@ def _fetch_page(username: str, api_key: str, start: str, end: str,
     }
     if use_fields:
         params["fields"] = CIN7_ORDER_FIELDS
+    try:
+        r = requests.get(
+            "https://api.cin7.com/api/v1/SalesOrders",
+            auth=(username, api_key),
+            params=params,
+            timeout=60,
+        )
+        # Store debug info for first page
+        if page == 1:
+            try:
+                import streamlit as _st
+                _st.session_state["_api_debug"] = {
+                    "status_code": r.status_code,
+                    "url": r.url,
+                    "response_preview": str(r.text[:500]),
+                }
+            except Exception:
+                pass
+        if r.status_code in (400, 422) and use_fields:
+            params.pop("fields", None)
+            r = requests.get(
+                "https://api.cin7.com/api/v1/SalesOrders",
+                auth=(username, api_key),
+                params=params,
+                timeout=60,
+            )
+        if r.status_code != 200:
+            return [], True
+        orders = r.json() or []
+        hit_end = len(orders) < PAGE_SIZE
+        return orders, hit_end
+    except Exception as ex:
+        try:
+            import streamlit as _st
+            _st.session_state["_api_debug"] = {"exception": str(ex)}
+        except Exception:
+            pass
+        return [], True
     try:
         r = requests.get(
             "https://api.cin7.com/api/v1/SalesOrders",
@@ -1158,6 +1194,10 @@ def main():
         if debug:
             st.subheader("🐛 Debug — Last Fetch Results")
             st.json(debug)
+            api_debug = st.session_state.get("_api_debug")
+            if api_debug:
+                st.subheader("🌐 Cin7 API Response")
+                st.json(api_debug)
             st.divider()
 
         audit = st.session_state.get("audit")
