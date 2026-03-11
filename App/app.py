@@ -966,6 +966,9 @@ def main():
         st.subheader("📦 Cin7 API")
         cin7_user = st.text_input("Username", value=get_secret("CIN7_USERNAME"), key="cin7_user")
         cin7_key  = st.text_input("API Key",  value=get_secret("CIN7_API_KEY"), type="password", key="cin7_key")
+
+        # Defined here so it's always in scope regardless of control flow below
+        can_generate = bool(cin7_user and cin7_key)
         
         if cin7_user and cin7_key:
             if st.button("Test Cin7", key="test_cin7"):
@@ -1201,8 +1204,6 @@ def main():
                 st.rerun()
 
         st.divider()
-
-        can_generate = bool(cin7_user and cin7_key)
 
         if st.button("🔄 Generate Report", type="primary",
                      use_container_width=True, disabled=not can_generate):
