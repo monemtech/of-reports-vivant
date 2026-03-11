@@ -38,8 +38,8 @@ ORDERS_TTL_MINUTES = 15      # Open periods: re-check fingerprint every 15 min
 
 # Cin7 limits: 500 rows/page is the max — use it
 PAGE_SIZE   = 500
-# Fetch this many pages simultaneously per period
-PAGE_BATCH  = 8
+# Cin7 rate limit: 3 req/sec — keep batch small
+PAGE_BATCH  = 2
 
 CIN7_ORDER_FIELDS = (
     "id,company,billingCompany,firstName,lastName,"
@@ -335,15 +335,14 @@ def _fetch_page(username: str, api_key: str, start: str, end: str,
 # CIN7 — PARALLEL BATCH PAGE FETCH
 # =============================================================================
 
+import time
+
 def fetch_orders_fast(username: str, api_key: str,
                       start_date: str, end_date: str,
                       label: str = "") -> list:
     """
     Fetch all orders for a date range using parallel page batching.
-    Strategy:
-    - Fetch PAGE_BATCH pages simultaneously
-    - Stop when any page returns < PAGE_SIZE rows (that's the last page)
-    - 4-8x faster than sequential pagination
+    Respects Cin7 rate limit: 3 req/sec, 60/min.
     """
     all_orders = []
     batch_start = 1
@@ -372,6 +371,9 @@ def fetch_orders_fast(username: str, api_key: str,
 
         if done:
             break
+
+        # Respect Cin7 rate limit: 3 req/sec
+        time.sleep(0.8)
         batch_start += PAGE_BATCH
 
     return all_orders
@@ -729,7 +731,7 @@ def run_full_fetch(cin7_user: str, cin7_key: str, hubspot_key: str,
         return p, s, e, fp
 
     probed = []
-    with ThreadPoolExecutor(max_workers=min(len(periods), 4)) as ex:
+    with ThreadPoolExecutor(max_workers=1) as ex:
         futs = [ex.submit(_probe_or_skip, p, cin7_user, cin7_key) for p in periods]
         for f in as_completed(futs):
             probed.append(f.result())
@@ -771,7 +773,7 @@ def run_full_fetch(cin7_user: str, cin7_key: str, hubspot_key: str,
     fetch_warnings    = []
 
     tasks = {}
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=2) as ex:
         for args in needs_fetch:
             fut = ex.submit(_fetch_period, *args, cin7_user, cin7_key)
             tasks[fut] = "cin7"
