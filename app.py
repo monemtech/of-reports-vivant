@@ -1,53 +1,57 @@
 """
 OrderFloz — Management Reporting Dashboard
 ==========================================
-Standalone sales intelligence reporting:
-- Year-over-Year sales comparison by account
-- Filter by Sales Rep, Tier
-- Export to Excel
-- Charts & visualizations
+Vivant Skin Care | Wholesale B2B Sales Intelligence
 """
 
+# =============================================================================
+# IMPORTS
+# =============================================================================
 import streamlit as st
 import pandas as pd
 import requests
-from datetime import datetime, timedelta
+import pickle
+import hashlib
 import json
-from pathlib import Path
 import io
+import threading
+from pathlib import Path
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 
 # =============================================================================
 # PAGE CONFIG
 # =============================================================================
-st.set_page_config(
-    page_title="OrderFloz Reports",
-    page_icon="📊",
-    layout="wide"
-)
+st.set_page_config(page_title="OrderFloz Reports", page_icon="📊", layout="wide")
 
 # =============================================================================
-# CONSTANTS & CONFIG
+# CONSTANTS
 # =============================================================================
-CONFIG_FILE      = Path(".orderfloz_reports_config.json")
-CACHE_META_FILE  = Path(".orderfloz_cache_meta.json")
-CACHE_DIR        = Path(".orderfloz_cache")
+CONFIG_FILE     = Path(".orderfloz_reports_config.json")
+CACHE_META_FILE = Path(".orderfloz_cache_meta.json")
+CACHE_DIR       = Path(".orderfloz_cache")
 CACHE_DIR.mkdir(exist_ok=True)
 
-# How long HubSpot data is considered fresh before re-fetching
-HUBSPOT_TTL_HOURS = 4
+HUBSPOT_TTL_HOURS  = 24      # HubSpot tiers change infrequently
+CONTACTS_TTL_HOURS = 12      # Cin7 contacts (reps/types) change infrequently
+ORDERS_TTL_MINUTES = 15      # Open periods: re-check fingerprint every 15 min
 
-BRANDING = {
-    "company_name": "OrderFloz",
-    "primary_color": "#1a5276",
-    "accent_color": "#00d4aa"
-}
+# Cin7 limits: 500 rows/page is the max — use it
+PAGE_SIZE   = 500
+# Fetch this many pages simultaneously per period
+PAGE_BATCH  = 8
 
-CURRENT_YEAR  = datetime.now().year
-ANALYSIS_YEARS = [CURRENT_YEAR - 2, CURRENT_YEAR - 1, CURRENT_YEAR]
+CIN7_ORDER_FIELDS = (
+    "id,company,billingCompany,firstName,lastName,"
+    "email,total,createdDate,modifiedDate,salesPersonId,source"
+)
+
+BRANDING = {"company_name": "OrderFloz", "primary_color": "#1a5276", "accent_color": "#00d4aa"}
 
 # =============================================================================
-# CONFIG PERSISTENCE
+# CONFIG HELPERS
 # =============================================================================
+
 def load_config() -> dict:
     try:
         if CONFIG_FILE.exists():
@@ -71,25 +75,16 @@ def get_secret(key: str, default: str = "") -> str:
         return default
 
 def get_excluded_domains() -> set:
-    """
-    Load email domains whose orders should be excluded (employees, internal accounts).
-    Priority: config file (saved via sidebar) → Streamlit secrets → default.
-    Example: "vivantskincare.com, monemtech.com"
-    Always lowercase.
-    """
     raw = load_config().get("excluded_domains", "") or get_secret("EXCLUDED_DOMAINS", "")
     if not raw:
         return set()
     return {d.strip().lower() for d in raw.split(",") if d.strip()}
 
 # =============================================================================
-# DISK CACHE  (orders + HubSpot)
+# DISK CACHE
 # =============================================================================
-import pickle
-import hashlib
 
 def _cache_key(label: str) -> str:
-    """Stable filename-safe key for a period label."""
     return hashlib.md5(label.encode()).hexdigest()
 
 def _load_cache_meta() -> dict:
@@ -107,8 +102,7 @@ def _save_cache_meta(meta: dict):
         pass
 
 def cache_save_orders(label: str, orders: list, fingerprint: str):
-    """Persist orders list + fingerprint. Never saves empty results."""
-    if not orders:          # empty = broken fetch; do not poison cache
+    if not orders:
         return
     try:
         key  = _cache_key(label)
@@ -116,43 +110,60 @@ def cache_save_orders(label: str, orders: list, fingerprint: str):
         with open(path, "wb") as f:
             pickle.dump(orders, f)
         meta = _load_cache_meta()
-        meta[f"cin7_{key}"] = {"label": label, "fingerprint": fingerprint,
-                                "saved_at": datetime.now().isoformat(),
-                                "count": len(orders)}
+        meta[f"cin7_{key}"] = {
+            "label": label, "fingerprint": fingerprint,
+            "saved_at": datetime.now().isoformat(), "count": len(orders),
+        }
         _save_cache_meta(meta)
     except Exception:
         pass
 
 def cache_load_orders(label: str, fingerprint: str):
-    """
-    Return cached orders if fingerprint matches, else None.
-    Rejects empty caches (poisoned from a prior failed fetch).
-    For closed periods (end < today) fingerprint is ignored — data can never change.
-    """
     try:
-        key  = _cache_key(label)
-        meta = _load_cache_meta()
+        key   = _cache_key(label)
+        meta  = _load_cache_meta()
         entry = meta.get(f"cin7_{key}")
-        if not entry:
-            return None
-        # Reject anything cached with zero orders
-        if entry.get("count", 1) == 0:
+        if not entry or entry.get("count", 1) == 0:
             return None
         path = CACHE_DIR / f"orders_{key}.pkl"
         if not path.exists():
             return None
         if entry["fingerprint"] == fingerprint or fingerprint == "CLOSED":
             data = pickle.load(open(path, "rb"))
-            # Double-check loaded data isn't empty
-            if not data:
-                return None
-            return data
+            return data if data else None
     except Exception:
         pass
     return None
 
+def cache_has_orders(label: str) -> bool:
+    """Check if ANY cached orders exist for label (no fingerprint check)."""
+    try:
+        key   = _cache_key(label)
+        meta  = _load_cache_meta()
+        entry = meta.get(f"cin7_{key}")
+        if not entry or entry.get("count", 1) == 0:
+            return False
+        return (CACHE_DIR / f"orders_{key}.pkl").exists()
+    except Exception:
+        return False
+
+def cache_load_orders_any(label: str):
+    """Load cached orders regardless of fingerprint — for instant display."""
+    try:
+        key  = _cache_key(label)
+        meta = _load_cache_meta()
+        entry = meta.get(f"cin7_{key}")
+        if not entry or entry.get("count", 1) == 0:
+            return None
+        path = CACHE_DIR / f"orders_{key}.pkl"
+        if not path.exists():
+            return None
+        data = pickle.load(open(path, "rb"))
+        return data if data else None
+    except Exception:
+        return None
+
 def cache_save_hubspot(tiers: dict, owners: dict):
-    """Persist HubSpot company data with timestamp."""
     try:
         path = CACHE_DIR / "hubspot.pkl"
         with open(path, "wb") as f:
@@ -164,15 +175,13 @@ def cache_save_hubspot(tiers: dict, owners: dict):
         pass
 
 def cache_load_hubspot():
-    """Return (tiers, owners) if cache is within TTL, else (None, None)."""
     try:
         meta  = _load_cache_meta()
         entry = meta.get("hubspot")
         if not entry:
             return None, None
-        saved_at = datetime.fromisoformat(entry["saved_at"])
-        age_hours = (datetime.now() - saved_at).total_seconds() / 3600
-        if age_hours > HUBSPOT_TTL_HOURS:
+        age_h = (datetime.now() - datetime.fromisoformat(entry["saved_at"])).total_seconds() / 3600
+        if age_h > HUBSPOT_TTL_HOURS:
             return None, None
         path = CACHE_DIR / "hubspot.pkl"
         if not path.exists():
@@ -184,8 +193,35 @@ def cache_load_hubspot():
         pass
     return None, None
 
+def cache_save_contacts(customers: dict):
+    try:
+        path = CACHE_DIR / "contacts.pkl"
+        with open(path, "wb") as f:
+            pickle.dump(customers, f)
+        meta = _load_cache_meta()
+        meta["contacts"] = {"saved_at": datetime.now().isoformat(), "count": len(customers)}
+        _save_cache_meta(meta)
+    except Exception:
+        pass
+
+def cache_load_contacts():
+    try:
+        meta  = _load_cache_meta()
+        entry = meta.get("contacts")
+        if not entry:
+            return None
+        age_h = (datetime.now() - datetime.fromisoformat(entry["saved_at"])).total_seconds() / 3600
+        if age_h > CONTACTS_TTL_HOURS:
+            return None
+        path = CACHE_DIR / "contacts.pkl"
+        if not path.exists():
+            return None
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
 def cache_clear_all():
-    """Wipe all cached data (manual override)."""
     try:
         for f in CACHE_DIR.iterdir():
             f.unlink()
@@ -194,78 +230,131 @@ def cache_clear_all():
     except Exception:
         pass
 
-def cache_purge_empty_entries():
-    """On startup, remove any cached periods that stored 0 orders (poisoned cache)."""
-    try:
-        meta = _load_cache_meta()
-        dirty = False
-        for k, v in list(meta.items()):
-            if k.startswith("cin7_") and v.get("count", 1) == 0:
-                pkl = CACHE_DIR / f"orders_{k[5:]}.pkl"
-                if pkl.exists():
-                    pkl.unlink()
-                del meta[k]
-                dirty = True
-        if dirty:
-            _save_cache_meta(meta)
-    except Exception:
-        pass
-
 # =============================================================================
 # SESSION STATE
 # =============================================================================
-if 'report_data' not in st.session_state:
-    st.session_state.report_data = None
-if 'cin7_orders_cache' not in st.session_state:
-    st.session_state.cin7_orders_cache = None
-if 'hubspot_companies_cache' not in st.session_state:
-    st.session_state.hubspot_companies_cache = None
-if 'audit' not in st.session_state:
-    st.session_state.audit = None
-if 'config_loaded' not in st.session_state:
-    st.session_state.config_loaded = load_config()
 
-# Auto-remove any zero-order cache entries from prior broken runs
-cache_purge_empty_entries()
+def _init_session():
+    defaults = {
+        "report_data":   None,
+        "audit":         None,
+        "periods":       [],
+        "config_loaded": load_config(),
+        "cin7_staff":    {},
+        "cin7_customers":{},
+        "fetching":      False,
+        "fetch_status":  "",
+        "last_fetch_ts": None,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+_init_session()
 
 # =============================================================================
-# CIN7 API FUNCTIONS
+# CIN7 — SINGLE PAGE FETCH (used internally by parallel fetcher)
 # =============================================================================
-def test_cin7_connection(username: str, api_key: str) -> tuple:
-    """Test Cin7 API credentials."""
+
+def _fetch_page(username: str, api_key: str, start: str, end: str,
+                page: int, use_fields: bool = True):
+    """Fetch a single page. Returns (orders_list, hit_end).
+    hit_end=True means this was the last page."""
+    params = {
+        "where": f"createdDate >= '{start}' AND createdDate <= '{end}'",
+        "page":  page,
+        "rows":  PAGE_SIZE,
+    }
+    if use_fields:
+        params["fields"] = CIN7_ORDER_FIELDS
     try:
         r = requests.get(
             "https://api.cin7.com/api/v1/SalesOrders",
             auth=(username, api_key),
-            params={"rows": 1},
-            timeout=15
+            params=params,
+            timeout=60,
         )
-        if r.status_code == 200:
-            return True, "Connected"
-        elif r.status_code == 401:
-            return False, "Invalid credentials"
-        else:
-            return False, f"Error {r.status_code}"
-    except Exception as e:
-        return False, str(e)
+        if r.status_code in (400, 422) and use_fields:
+            # Retry without fields filter
+            params.pop("fields", None)
+            r = requests.get(
+                "https://api.cin7.com/api/v1/SalesOrders",
+                auth=(username, api_key),
+                params=params,
+                timeout=60,
+            )
+        if r.status_code != 200:
+            return [], True
+        orders = r.json() or []
+        hit_end = len(orders) < PAGE_SIZE
+        return orders, hit_end
+    except Exception:
+        return [], True
+
+# =============================================================================
+# CIN7 — PARALLEL BATCH PAGE FETCH
+# =============================================================================
+
+def fetch_orders_fast(username: str, api_key: str,
+                      start_date: str, end_date: str,
+                      label: str = "") -> list:
+    """
+    Fetch all orders for a date range using parallel page batching.
+    
+    Strategy:
+    - Fetch PAGE_BATCH pages simultaneously
+    - Stop when any page returns < PAGE_SIZE rows (that's the last page)
+    - 4-8x faster than sequential pagination
+    """
+    all_orders = []
+    batch_start = 1
+
+    while True:
+        page_nums = range(batch_start, batch_start + PAGE_BATCH)
+
+        with ThreadPoolExecutor(max_workers=PAGE_BATCH) as ex:
+            future_map = {
+                ex.submit(_fetch_page, username, api_key, start_date, end_date, p): p
+                for p in page_nums
+            }
+            results = {}
+            for f in as_completed(future_map):
+                p = future_map[f]
+                results[p] = f.result()
+
+        # Process in page order; stop at first short page
+        done = False
+        for p in page_nums:
+            orders, hit_end = results[p]
+            all_orders.extend(orders)
+            if hit_end:
+                done = True
+                break
+
+        if done:
+            break
+        batch_start += PAGE_BATCH
+
+    return all_orders
+
+# =============================================================================
+# CIN7 — FINGERPRINT PROBE
+# =============================================================================
 
 def probe_cin7_fingerprint(username: str, api_key: str,
-                           start_date: str, end_date: str) -> str:
-    """
-    Fetch ONE order (latest modified) for a date range to get a change fingerprint.
-    Returns "id:modifiedDate" string.  Fast — single API call, 1 row.
-    """
+                            start_date: str, end_date: str) -> str:
+    """Single-row probe to detect if data has changed."""
     try:
         r = requests.get(
             "https://api.cin7.com/api/v1/SalesOrders",
             auth=(username, api_key),
             params={
-                "where": f"createdDate >= '{start_date}' AND createdDate <= '{end_date}'",
-                "rows": 1,
-                "order": "modifiedDate desc",
-                "fields": "id,modifiedDate"
+                "where":  f"createdDate >= '{start_date}' AND createdDate <= '{end_date}'",
+                "rows":   1,
+                "order":  "modifiedDate desc",
+                "fields": "id,modifiedDate",
             },
-            timeout=10
+            timeout=10,
         )
         if r.status_code == 200:
             data = r.json()
@@ -276,177 +365,233 @@ def probe_cin7_fingerprint(username: str, api_key: str,
         pass
     return ""
 
-# Only fetch the fields we actually use — cuts payload by ~85%
-# NOTE: if Cin7 rejects the fields param, we fall back to full fetch automatically
-CIN7_FIELDS = "id,company,billingCompany,firstName,lastName,email,total,createdDate,modifiedDate,salesPersonEmail,source"
+# =============================================================================
+# CIN7 — STAFF
+# =============================================================================
 
-def fetch_orders_by_date_range(username: str, api_key: str,
-                               start_date: str, end_date: str,
-                               label: str = "",
-                               progress_callback=None) -> list:
-    """Fetch all orders between two dates from Cin7."""
-    all_orders = []
-    page = 1
-    use_fields = True  # try slim fetch first; fall back to full if rejected
+def fetch_cin7_staff(username: str, api_key: str) -> dict:
+    if st.session_state.cin7_staff:
+        return st.session_state.cin7_staff
+    staff = {}
+    try:
+        r = requests.get(
+            "https://api.cin7.com/api/v1/Users",
+            auth=(username, api_key), timeout=15,
+        )
+        if r.status_code == 200:
+            for u in r.json():
+                uid  = u.get("id") or u.get("userId")
+                name = f"{u.get('firstName','').strip()} {u.get('lastName','').strip()}".strip()
+                if uid and name:
+                    staff[uid] = name
+    except Exception:
+        pass
+    st.session_state.cin7_staff = staff
+    return staff
+
+# =============================================================================
+# CIN7 — CONTACTS  (disk-cached with TTL)
+# =============================================================================
+
+def fetch_cin7_customers(username: str, api_key: str) -> dict:
+    """
+    Fetch Cin7 Contacts. Returns {COMPANY_UPPER: {rep, type}}.
+    Disk-cached with 12h TTL — contacts rarely change.
+    """
+    # Check disk cache first
+    cached = cache_load_contacts()
+    if cached is not None:
+        st.session_state.cin7_customers = cached
+        return cached
+
+    customers = {}
+    page      = 1
+    fields    = "id,name,salesRepresentative,customFields"
 
     while True:
-        if progress_callback:
-            progress_callback(f"Fetching {label} orders... page {page} ({len(all_orders)} so far)")
         try:
-            params = {
-                "where": f"createdDate >= '{start_date}' AND createdDate <= '{end_date}'",
-                "page":  page,
-                "rows":  250,
-            }
-            if use_fields:
-                params["fields"] = CIN7_FIELDS
-
             r = requests.get(
-                "https://api.cin7.com/api/v1/SalesOrders",
+                "https://api.cin7.com/api/v1/Contacts",
                 auth=(username, api_key),
-                params=params,
-                timeout=60
+                params={"page": page, "rows": 500, "fields": fields},
+                timeout=30,
             )
-
-            # If fields param caused a 400/422, retry without it
-            if r.status_code in (400, 422) and use_fields:
-                use_fields = False
-                continue
-
             if r.status_code != 200:
-                st.warning(f"Cin7 returned {r.status_code} on page {page}: {r.text[:200]}")
                 break
-
-            orders = r.json()
-            if not orders:
+            data = r.json()
+            if not data:
                 break
-            all_orders.extend(orders)
-            if len(orders) < 250:
+            for c in data:
+                name = (c.get("name") or "").strip().upper()
+                if not name:
+                    continue
+                rep   = (c.get("salesRepresentative") or "").strip()
+                cf    = c.get("customFields") or {}
+                ctype = ""
+                for k, v in cf.items():
+                    if k == "Members_1037" or k.lower() == "type":
+                        ctype = str(v).strip() if v else ""
+                        break
+                customers[name] = {"rep": rep, "type": ctype}
+            if len(data) < 500:
                 break
             page += 1
-        except Exception as e:
-            st.warning(f"Error fetching page {page}: {e}")
+        except Exception:
             break
-    return all_orders
 
+    cache_save_contacts(customers)
+    st.session_state.cin7_customers = customers
+    return customers
 
-def fetch_all_periods_parallel(username: str, api_key: str, periods: list,
-                                status_placeholder=None) -> list:
-    """
-    Fetch all periods in parallel using threads.
-    Returns combined flat list of all orders.
-    """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+# =============================================================================
+# HUBSPOT
+# =============================================================================
 
-    results = {}
+def test_cin7_connection(username: str, api_key: str) -> tuple:
+    try:
+        r = requests.get("https://api.cin7.com/api/v1/SalesOrders",
+                         auth=(username, api_key), params={"rows": 1}, timeout=15)
+        if r.status_code == 200: return True, "Connected"
+        if r.status_code == 401: return False, "Invalid credentials"
+        return False, f"HTTP {r.status_code}"
+    except Exception as e:
+        return False, str(e)
 
-    def fetch_one(p):
-        start_str = p["start"].strftime("%Y-%m-%dT00:00:00Z")
-        end_str   = p["end"].strftime("%Y-%m-%dT23:59:59Z")
-        orders = fetch_orders_by_date_range(username, api_key, start_str, end_str, label=p["label"])
-        return p["label"], orders
+def test_hubspot_connection(api_key: str) -> tuple:
+    try:
+        r = requests.get("https://api.hubapi.com/crm/v3/objects/companies",
+                         headers={"Authorization": f"Bearer {api_key}"},
+                         params={"limit": 1}, timeout=15)
+        if r.status_code == 200: return True, "Connected"
+        if r.status_code == 401: return False, "Invalid API key"
+        return False, f"HTTP {r.status_code}"
+    except Exception as e:
+        return False, str(e)
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {executor.submit(fetch_one, p): p for p in periods}
-        for future in as_completed(futures):
-            label, orders = future.result()
-            results[label] = orders
-            if status_placeholder:
-                done = len(results)
-                status_placeholder.text(f"Fetching orders... {done}/{len(periods)} periods complete")
+def fetch_hubspot_company_data(api_key: str, tier_property: str = "commission_tier") -> tuple:
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    tiers = {}; owners = {}; after = None
+    while True:
+        params = {"limit": 100, "properties": f"name,{tier_property},hubspot_owner_id"}
+        if after:
+            params["after"] = after
+        try:
+            r = requests.get("https://api.hubapi.com/crm/v3/objects/companies",
+                             headers=headers, params=params, timeout=30)
+            if r.status_code != 200:
+                break
+            data = r.json()
+            for company in data.get("results", []):
+                props = company.get("properties", {})
+                name  = (props.get("name") or "").strip().upper()
+                if not name:
+                    continue
+                tiers[name]  = props.get(tier_property, "") or ""
+                owner_id     = props.get("hubspot_owner_id") or ""
+                if owner_id:
+                    owners[name] = str(owner_id)
+            after = data.get("paging", {}).get("next", {}).get("after")
+            if not after:
+                break
+        except Exception as e:
+            st.warning(f"HubSpot error: {e}")
+            break
+    return tiers, owners
 
-    # Flatten in period order
-    all_orders = []
-    for p in periods:
-        all_orders.extend(results.get(p["label"], []))
-    return all_orders
-def aggregate_orders_by_company(orders: list, periods: list) -> tuple:
-    """
-    Aggregate orders by company name across dynamic periods.
-    Excludes:
-      - Retail / Shopify channel orders (B2C)
-      - Orders where the customer email matches an excluded domain (employees)
-    Returns: (company_data dict, audit dict)
-    """
+def fetch_hubspot_owners(api_key: str) -> dict:
+    try:
+        r = requests.get("https://api.hubapi.com/crm/v3/owners",
+                         headers={"Authorization": f"Bearer {api_key}"},
+                         params={"limit": 100}, timeout=15)
+        if r.status_code != 200:
+            return {}
+        result = {}
+        for o in r.json().get("results", []):
+            oid  = str(o.get("id", ""))
+            name = f"{o.get('firstName','').strip()} {o.get('lastName','').strip()}".strip() \
+                   or o.get("email", "")
+            if oid:
+                result[oid] = name
+        return result
+    except Exception:
+        return {}
+
+# =============================================================================
+# ORDER AGGREGATION
+# =============================================================================
+
+def aggregate_orders_by_company(orders: list, periods: list,
+                                  cin7_staff: dict = None) -> tuple:
     excluded_domains = get_excluded_domains()
+    period_labels    = [p["label"] for p in periods]
 
     def get_period_label(date_str):
         if not date_str:
             return None
         try:
-            order_date = datetime.fromisoformat(date_str[:10]).date()
-        except:
+            d = datetime.fromisoformat(date_str[:10]).date()
+        except Exception:
             return None
         for p in periods:
-            if p["start"] <= order_date <= p["end"]:
+            if p["start"] <= d <= p["end"]:
                 return p["label"]
         return None
 
     def email_domain(email: str) -> str:
-        email = (email or '').strip().lower()
-        return email.split('@')[-1] if '@' in email else ''
+        email = (email or "").strip().lower()
+        return email.split("@")[-1] if "@" in email else ""
 
-    company_data  = {}
-    period_labels = [p["label"] for p in periods]
-
+    company_data = {}
     audit = {
-        "total_raw":               len(orders),
-        "included":                0,
-        "excluded_source":         0,
-        "excluded_domain":         0,
-        "excluded_no_period":      0,
-        "excluded_zero_total":     0,
-        "unknown_company":         0,
-        "by_period":               {lbl: {"included": 0, "excluded_source": 0,
-                                           "revenue": 0.0} for lbl in period_labels},
-        "excluded_sources":        {},
-        "excluded_domain_counts":  {},   # domain → order count
-        "sample_excluded":         [],
+        "total_raw": len(orders), "included": 0,
+        "excluded_source": 0, "excluded_domain": 0,
+        "excluded_no_period": 0, "excluded_zero_total": 0,
+        "unknown_company": 0, "unique_companies": 0,
+        "by_period": {lbl: {"included": 0, "excluded_source": 0, "revenue": 0.0}
+                      for lbl in period_labels},
+        "excluded_sources": {}, "excluded_domain_counts": {}, "sample_excluded": [],
     }
 
     for order in orders:
-        company = (order.get('company') or order.get('billingCompany') or '').strip()
+        company = (order.get("company") or order.get("billingCompany") or "").strip()
         if not company:
-            first   = order.get('firstName', '')
-            last    = order.get('lastName', '')
-            company = f"{first} {last}".strip() or 'Unknown'
-            if company == 'Unknown':
+            first   = order.get("firstName", "")
+            last    = order.get("lastName",  "")
+            company = f"{first} {last}".strip() or "Unknown"
+            if company == "Unknown":
                 audit["unknown_company"] += 1
 
-        total        = float(order.get('total') or 0)
-        rep_email    = (order.get('salesPersonEmail') or '').strip()
-        cust_email   = (order.get('email') or '').strip()
-        created_date = order.get('createdDate', '')
-        period_label = get_period_label(created_date)
-        source       = (order.get('source') or '').strip()
+        total        = float(order.get("total") or 0)
+        sp_id        = order.get("salesPersonId")
+        rep_name     = (cin7_staff or {}).get(sp_id, "") if sp_id else ""
+        cust_email   = (order.get("email") or "").strip()
+        created_date = order.get("createdDate", "")
+        source       = (order.get("source") or "").strip()
         source_lower = source.lower()
+        period_label = get_period_label(created_date)
 
-        # ── Exclude: retail / Shopify ──────────────────────────────────
-        if 'shopify' in source_lower or 'retail' in source_lower:
+        if "shopify" in source_lower or "retail" in source_lower:
             audit["excluded_source"] += 1
             audit["excluded_sources"][source] = audit["excluded_sources"].get(source, 0) + 1
-            if period_label and period_label in period_labels:
+            if period_label in period_labels:
                 audit["by_period"][period_label]["excluded_source"] += 1
             if len(audit["sample_excluded"]) < 10:
-                audit["sample_excluded"].append({
-                    "reason": f"source={source}", "company": company,
-                    "total": total, "date": created_date[:10] if created_date else ""})
+                audit["sample_excluded"].append({"reason": f"source={source}",
+                    "company": company, "total": total,
+                    "date": created_date[:10] if created_date else ""})
             continue
 
-        # ── Exclude: employee email domains ───────────────────────────
         domain = email_domain(cust_email)
         if excluded_domains and domain in excluded_domains:
             audit["excluded_domain"] += 1
             audit["excluded_domain_counts"][domain] = \
                 audit["excluded_domain_counts"].get(domain, 0) + 1
             if len(audit["sample_excluded"]) < 10:
-                audit["sample_excluded"].append({
-                    "reason": f"excluded domain ({domain})", "company": company,
-                    "email": cust_email, "total": total,
+                audit["sample_excluded"].append({"reason": f"excluded domain ({domain})",
+                    "company": company, "email": cust_email, "total": total,
                     "date": created_date[:10] if created_date else ""})
             continue
 
-        # ── Exclude: outside date windows ─────────────────────────────
         if period_label is None or period_label not in period_labels:
             audit["excluded_no_period"] += 1
             continue
@@ -455,16 +600,16 @@ def aggregate_orders_by_company(orders: list, periods: list) -> tuple:
             audit["excluded_zero_total"] += 1
 
         if company not in company_data:
-            company_data[company] = {'rep': rep_email, 'order_count': 0}
+            company_data[company] = {"rep": rep_name, "order_count": 0}
             for lbl in period_labels:
                 company_data[company][lbl] = 0.0
 
-        company_data[company][period_label] += total
-        company_data[company]['order_count'] += 1
-        if rep_email and not company_data[company]['rep']:
-            company_data[company]['rep'] = rep_email
+        company_data[company][period_label]  += total
+        company_data[company]["order_count"] += 1
+        if rep_name and not company_data[company]["rep"]:
+            company_data[company]["rep"] = rep_name
 
-        audit["included"] += 1
+        audit["included"]                            += 1
         audit["by_period"][period_label]["included"] += 1
         audit["by_period"][period_label]["revenue"]  += total
 
@@ -472,236 +617,52 @@ def aggregate_orders_by_company(orders: list, periods: list) -> tuple:
     return company_data, audit
 
 # =============================================================================
-# HUBSPOT API FUNCTIONS
+# REPORT DATAFRAME BUILDER
 # =============================================================================
-def get_hubspot_headers(api_key: str) -> dict:
-    return {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
 
-def test_hubspot_connection(api_key: str) -> tuple:
-    """Test HubSpot API credentials."""
-    try:
-        r = requests.get(
-            "https://api.hubapi.com/crm/v3/objects/companies",
-            headers=get_hubspot_headers(api_key),
-            params={"limit": 1},
-            timeout=15
-        )
-        if r.status_code == 200:
-            return True, "Connected"
-        elif r.status_code == 401:
-            return False, "Invalid API key"
-        else:
-            return False, f"Error {r.status_code}"
-    except Exception as e:
-        return False, str(e)
-
-def fetch_hubspot_companies_with_tier(api_key: str, tier_property: str = "commission_tier",
-                                       progress_callback=None) -> dict:
-    """
-    Fetch all companies from HubSpot with their Tier property.
-    Returns dict: {company_name_upper: tier_value}
-    """
-    headers = get_hubspot_headers(api_key)
-    companies = {}
-    after = None
-    page = 1
-    
-    while True:
-        if progress_callback:
-            progress_callback(f"Fetching HubSpot companies... page {page}")
-        
-        params = {
-            "limit": 100,
-            "properties": f"name,{tier_property}"
-        }
-        if after:
-            params["after"] = after
-        
-        try:
-            r = requests.get(
-                "https://api.hubapi.com/crm/v3/objects/companies",
-                headers=headers,
-                params=params,
-                timeout=30
-            )
-            if r.status_code != 200:
-                break
-            
-            data = r.json()
-            results = data.get('results', [])
-            
-            for company in results:
-                props = company.get('properties', {})
-                name = (props.get('name') or '').strip().upper()
-                tier = props.get(tier_property, '') or ''
-                if name:
-                    companies[name] = tier
-            
-            # Check for more pages
-            paging = data.get('paging', {})
-            next_page = paging.get('next', {})
-            after = next_page.get('after')
-            
-            if not after:
-                break
-            page += 1
-            
-        except Exception as e:
-            st.warning(f"Error fetching HubSpot companies: {e}")
-            break
-    
-    return companies
-
-def fetch_hubspot_owners(api_key: str) -> dict:
-    """
-    Fetch all HubSpot owners (users).
-    Returns dict: {owner_id: full_name}
-    """
-    headers = get_hubspot_headers(api_key)
-    try:
-        r = requests.get(
-            "https://api.hubapi.com/crm/v3/owners",
-            headers=headers,
-            params={"limit": 100},
-            timeout=15
-        )
-        if r.status_code != 200:
-            return {}
-        owners = {}
-        for o in r.json().get('results', []):
-            oid = str(o.get('id', ''))
-            first = o.get('firstName', '')
-            last = o.get('lastName', '')
-            email = o.get('email', '')
-            name = f"{first} {last}".strip() or email
-            if oid:
-                owners[oid] = name
-        return owners
-    except Exception as e:
-        st.warning(f"Could not fetch HubSpot owners: {e}")
-        return {}
-
-
-def fetch_hubspot_company_data(api_key: str, tier_property: str = "commission_tier",
-                               progress_callback=None) -> tuple:
-    """
-    Single HubSpot companies fetch that returns BOTH tiers and owner IDs.
-    Replaces fetch_hubspot_companies_with_tier + fetch_hubspot_company_owners.
-    Returns: (tiers_dict, company_owners_dict)
-      tiers_dict:         {company_name_upper: tier_value}
-      company_owners_dict:{company_name_upper: owner_id}
-    """
-    headers = get_hubspot_headers(api_key)
-    tiers = {}
-    owners = {}
-    after = None
-    page = 1
-
-    while True:
-        if progress_callback:
-            progress_callback(f"Fetching HubSpot companies... page {page}")
-
-        params = {
-            "limit": 100,
-            "properties": f"name,{tier_property},hubspot_owner_id"
-        }
-        if after:
-            params["after"] = after
-
-        try:
-            r = requests.get(
-                "https://api.hubapi.com/crm/v3/objects/companies",
-                headers=headers,
-                params=params,
-                timeout=30
-            )
-            if r.status_code != 200:
-                break
-
-            data = r.json()
-            for company in data.get('results', []):
-                props = company.get('properties', {})
-                name = (props.get('name') or '').strip().upper()
-                if not name:
-                    continue
-                tiers[name]  = props.get(tier_property, '') or ''
-                owner_id     = props.get('hubspot_owner_id') or ''
-                if owner_id:
-                    owners[name] = str(owner_id)
-
-            paging = data.get('paging', {})
-            after = paging.get('next', {}).get('after')
-            if not after:
-                break
-            page += 1
-
-        except Exception as e:
-            st.warning(f"Error fetching HubSpot companies: {e}")
-            break
-
-    return tiers, owners
-
-
-# =============================================================================
-# DATA PROCESSING
-# =============================================================================
 def build_report_dataframe(company_data: dict, hubspot_tiers: dict, periods: list,
-                           company_owners: dict = None, owners_lookup: dict = None) -> pd.DataFrame:
-    """
-    Build the management report DataFrame.
-    Column names are derived directly from the selected period labels so
-    'YTD Sales' / 'Prior Year Sales' always reflect what was actually selected.
-    """
+                            company_owners: dict = None, owners_lookup: dict = None,
+                            cin7_customers: dict = None) -> pd.DataFrame:
+    labels        = [p["label"] for p in periods]
+    primary_label = labels[-1]
+    comp_label    = labels[-2] if len(labels) >= 2 else None
+    primary_col   = primary_label
+    comp_col      = comp_label if comp_label else "Comparison"
+
     rows = []
-
-    labels           = [p["label"] for p in periods]
-    primary_label    = labels[-1]
-    comparison_label = labels[-2] if len(labels) >= 2 else None
-
-    # Column names shown in the table — derived from real period labels
-    primary_col    = primary_label
-    comparison_col = comparison_label if comparison_label else "Comparison"
-
     for company, data in company_data.items():
-        primary_sales    = data.get(primary_label, 0)
-        comparison_sales = data.get(comparison_label, 0) if comparison_label else 0
-
-        if primary_sales == 0 and comparison_sales == 0:
+        primary_sales = data.get(primary_label, 0)
+        comp_sales    = data.get(comp_label, 0) if comp_label else 0
+        if primary_sales == 0 and comp_sales == 0:
             continue
 
-        tier = hubspot_tiers.get(company.upper(), '')
+        tier      = hubspot_tiers.get(company.upper(), "")
+        cin7_cust = (cin7_customers or {}).get(company.upper(), {})
+        rep       = cin7_cust.get("rep", "") or data.get("rep", "")
+        if not rep and company_owners and owners_lookup:
+            owner_id = company_owners.get(company.upper(), "")
+            rep      = owners_lookup.get(owner_id, "") if owner_id else ""
+        ctype = cin7_cust.get("type", "")
 
-        cin7_rep = data.get('rep', '')
-        if cin7_rep:
-            rep = cin7_rep
-        elif company_owners and owners_lookup:
-            owner_id = company_owners.get(company.upper(), '')
-            rep = owners_lookup.get(owner_id, '') if owner_id else ''
-        else:
-            rep = ''
-
-        if comparison_sales > 0:
-            change_pct = ((primary_sales - comparison_sales) / comparison_sales) * 100
+        if comp_sales > 0:
+            change_pct = ((primary_sales - comp_sales) / comp_sales) * 100
         elif primary_sales > 0:
             change_pct = 100.0
         else:
             change_pct = 0.0
-        change_dollars = primary_sales - comparison_sales
 
         rows.append({
-            'Account':          company,
-            primary_col:        primary_sales,
-            comparison_col:     comparison_sales,
-            '$ Change':         change_dollars,
-            '% Change':         change_pct,
-            'Tier':             tier,
-            'Sales Rep':        rep,
-            '_order_count':     data.get('order_count', 0),
-            '_primary_col':     primary_col,
-            '_comparison_col':  comparison_col,
+            "Account":         company,
+            primary_col:       primary_sales,
+            comp_col:          comp_sales,
+            "$ Change":        primary_sales - comp_sales,
+            "% Change":        change_pct,
+            "Type":            ctype,
+            "Tier":            tier,
+            "Sales Rep":       rep,
+            "_order_count":    data.get("order_count", 0),
+            "_primary_col":    primary_col,
+            "_comparison_col": comp_col,
         })
 
     df = pd.DataFrame(rows)
@@ -710,799 +671,696 @@ def build_report_dataframe(company_data: dict, hubspot_tiers: dict, periods: lis
     return df
 
 # =============================================================================
-# EXPORT FUNCTIONS
+# FULL FETCH PIPELINE  (called from button AND from auto-fetch)
 # =============================================================================
+
+def run_full_fetch(cin7_user: str, cin7_key: str, hubspot_key: str,
+                   tier_property: str, periods: list) -> dict:
+    """
+    Execute the complete data fetch pipeline.
+    Returns dict with keys: df, audit, hubspot_tiers, all_orders
+    Designed to run fast via parallel batching.
+    """
+    today_dt   = datetime.now().date()
+    all_orders = []
+
+    # ── Step 1: For each period, decide probe or use CLOSED shortcut ──────────
+    def _probe_or_skip(p, user, key):
+        s  = p["start"].strftime("%Y-%m-%dT00:00:00Z")
+        e  = p["end"].strftime("%Y-%m-%dT23:59:59Z")
+        fp = "CLOSED" if p["end"] < today_dt else probe_cin7_fingerprint(user, key, s, e)
+        return p, s, e, fp
+
+    probed = []
+    with ThreadPoolExecutor(max_workers=min(len(periods), 4)) as ex:
+        futs = [ex.submit(_probe_or_skip, p, cin7_user, cin7_key) for p in periods]
+        for f in as_completed(futs):
+            probed.append(f.result())
+
+    # ── Step 2: cache check ───────────────────────────────────────────────────
+    needs_fetch = []
+    for p, s, e, fp in probed:
+        cached = cache_load_orders(p["label"], fp)
+        if cached is not None:
+            all_orders.extend(cached)
+        else:
+            needs_fetch.append((p, s, e, fp))
+
+    # ── Step 3: parallel fast-fetch all needed periods + HubSpot + Contacts ──
+    hs_tiers  = {}
+    hs_owners = {}
+    hs_lookup = {}
+
+    def _fetch_period(p, s, e, fp, user, key):
+        orders = fetch_orders_fast(user, key, s, e, label=p["label"])
+        cache_save_orders(p["label"], orders, fp)
+        return orders
+
+    def _fetch_hs(api_key, tier_prop):
+        t, o = cache_load_hubspot()
+        if t is not None:
+            lk = fetch_hubspot_owners(api_key)
+            return t, o, lk
+        t, o = fetch_hubspot_company_data(api_key, tier_prop)
+        lk   = fetch_hubspot_owners(api_key)
+        cache_save_hubspot(t, o)
+        return t, o, lk
+
+    def _fetch_contacts(user, key):
+        return fetch_cin7_customers(user, key)
+
+    tasks = {}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for args in needs_fetch:
+            fut = ex.submit(_fetch_period, *args, cin7_user, cin7_key)
+            tasks[fut] = "cin7"
+        if hubspot_key:
+            hsfut = ex.submit(_fetch_hs, hubspot_key, tier_property)
+            tasks[hsfut] = "hubspot"
+        cust_fut = ex.submit(_fetch_contacts, cin7_user, cin7_key)
+        tasks[cust_fut] = "contacts"
+
+        for fut in as_completed(tasks):
+            kind = tasks[fut]
+            try:
+                if kind == "cin7":
+                    orders = fut.result()
+                    all_orders.extend(orders)
+                elif kind == "hubspot":
+                    hs_tiers, hs_owners, hs_lookup = fut.result()
+                elif kind == "contacts":
+                    st.session_state.cin7_customers = fut.result()
+            except Exception as err:
+                st.warning(f"Fetch error ({kind}): {err}")
+
+    # ── Step 4: build DataFrame ───────────────────────────────────────────────
+    cin7_staff   = fetch_cin7_staff(cin7_user, cin7_key)
+    company_data, audit = aggregate_orders_by_company(
+        all_orders, periods, cin7_staff=cin7_staff)
+    df = build_report_dataframe(
+        company_data, hs_tiers, periods, hs_owners, hs_lookup,
+        cin7_customers=st.session_state.cin7_customers)
+
+    return {"df": df, "audit": audit, "hubspot_tiers": hs_tiers, "all_orders": all_orders}
+
+# =============================================================================
+# EXPORT
+# =============================================================================
+
 def export_to_excel(df: pd.DataFrame) -> bytes:
-    """Export DataFrame to Excel bytes."""
     output = io.BytesIO()
-    
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, sheet_name='Sales Report', index=False)
-        
-        # Auto-adjust column widths
-        worksheet = writer.sheets['Sales Report']
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Sales Report", index=False)
+        ws = writer.sheets["Sales Report"]
         for idx, col in enumerate(df.columns):
-            max_length = max(
-                df[col].astype(str).map(len).max(),
-                len(col)
-            ) + 2
-            worksheet.column_dimensions[chr(65 + idx)].width = min(max_length, 50)
-    
+            width = min(max(df[col].astype(str).map(len).max(), len(col)) + 2, 50)
+            ws.column_dimensions[chr(65 + idx)].width = width
     return output.getvalue()
 
 # =============================================================================
-# CUSTOM CSS
+# CSS
 # =============================================================================
+
 def inject_css():
     st.markdown(f"""
     <style>
-        .main-header {{
-            text-align: center;
-            padding: 1rem 0;
-            margin-bottom: 2rem;
-        }}
-        .main-header h1 {{
-            color: {BRANDING['primary_color']};
-            margin: 0;
-        }}
-        .metric-row {{
-            display: flex;
-            gap: 1rem;
-            margin-bottom: 1rem;
-        }}
-        .metric-card {{
-            background: linear-gradient(135deg, #1a5276, #2980b9);
-            border-radius: 0.75rem;
-            padding: 1.25rem;
-            color: white;
-            flex: 1;
-            text-align: center;
-        }}
-        .metric-value {{
-            font-size: 2rem;
-            font-weight: bold;
-        }}
-        .metric-label {{
-            font-size: 0.875rem;
-            opacity: 0.9;
-        }}
-        .positive {{ color: #00d4aa; }}
-        .negative {{ color: #ff6b6b; }}
-        .filter-section {{
-            background: #f8f9fa;
-            padding: 1rem;
-            border-radius: 0.5rem;
-            margin-bottom: 1rem;
-        }}
-        div[data-testid="stDataFrame"] {{
-            width: 100%;
+        .main-header {{ text-align:center; padding:0.75rem 0 0.5rem; }}
+        .main-header h1 {{ color:{BRANDING['primary_color']}; margin:0; font-size:1.8rem; }}
+        .stale-banner {{
+            background:#fff3cd; border:1px solid #ffc107; border-radius:6px;
+            padding:0.4rem 0.8rem; font-size:0.85rem; margin-bottom:0.5rem;
         }}
     </style>
     """, unsafe_allow_html=True)
 
 # =============================================================================
-# CHART FUNCTIONS
+# CHARTS
 # =============================================================================
-def create_yoy_chart(df: pd.DataFrame, periods: list):
-    """Top 15 accounts — primary vs comparison bar chart."""
+
+def create_yoy_chart(df):
     import plotly.graph_objects as go
-
-    primary_col    = df['_primary_col'].iloc[0]    if '_primary_col'    in df.columns else 'Sales'
-    comparison_col = df['_comparison_col'].iloc[0] if '_comparison_col' in df.columns else 'Comparison'
-
-    top = df.nlargest(15, primary_col)
+    pc = df["_primary_col"].iloc[0]; cc = df["_comparison_col"].iloc[0]
+    top = df.nlargest(15, pc)
     fig = go.Figure()
-    if comparison_col in df.columns:
-        fig.add_trace(go.Bar(name=comparison_col, x=top['Account'],
-                             y=top[comparison_col], marker_color='#3498db'))
-    fig.add_trace(go.Bar(name=primary_col, x=top['Account'],
-                         y=top[primary_col], marker_color='#00d4aa'))
-    fig.update_layout(
-        title=f'Top 15 Accounts — {primary_col} vs {comparison_col}',
-        barmode='group', xaxis_tickangle=-45, height=500,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-    )
+    if cc in df.columns:
+        fig.add_trace(go.Bar(name=cc, x=top["Account"], y=top[cc], marker_color="#3498db"))
+    fig.add_trace(go.Bar(name=pc, x=top["Account"], y=top[pc], marker_color="#00d4aa"))
+    fig.update_layout(title=f"Top 15 Accounts - {pc} vs {cc}",
+                      barmode="group", xaxis_tickangle=-45, height=480,
+                      legend=dict(orientation="h", y=1.02, x=1, xanchor="right"))
     return fig
 
-def create_rep_performance_chart(df: pd.DataFrame):
-    """Sales rep performance chart — primary period."""
+def create_rep_chart(df):
     import plotly.express as px
-    primary_col = df['_primary_col'].iloc[0] if '_primary_col' in df.columns else 'Sales'
-    rep_data = df.groupby('Sales Rep').agg(
-        Sales=(primary_col, 'sum'), Accounts=('Account', 'count')
-    ).reset_index()
-    rep_data = rep_data[rep_data['Sales Rep'] != ''].sort_values('Sales', ascending=True)
-    fig = px.bar(rep_data, y='Sales Rep', x='Sales', orientation='h',
-                 title=f'{primary_col} by Rep', color='Sales',
-                 color_continuous_scale='Blues',
-                 labels={'Sales': f'{primary_col} ($)'})
-    fig.update_layout(height=400, showlegend=False)
-    return fig
+    pc = df["_primary_col"].iloc[0]
+    d  = df.groupby("Sales Rep").agg(Sales=(pc,"sum")).reset_index()
+    d  = d[d["Sales Rep"] != ""].sort_values("Sales", ascending=True)
+    if d.empty: return None
+    return px.bar(d, y="Sales Rep", x="Sales", orientation="h",
+                  title=f"{pc} by Rep", color="Sales",
+                  color_continuous_scale="Blues", height=380)
 
-def create_tier_breakdown_chart(df: pd.DataFrame):
-    """Tier breakdown by primary period sales."""
+def create_tier_chart(df):
     import plotly.express as px
-    primary_col = df['_primary_col'].iloc[0] if '_primary_col' in df.columns else 'Sales'
-    tier_data = df.groupby('Tier').agg(Sales=(primary_col, 'sum')).reset_index()
-    tier_data = tier_data[tier_data['Tier'] != '']
-    if tier_data.empty:
-        return None
-    fig = px.pie(tier_data, values='Sales', names='Tier',
-                 title=f'{primary_col} by Tier',
-                 color_discrete_sequence=px.colors.qualitative.Set2)
-    fig.update_layout(height=400)
-    return fig
+    pc = df["_primary_col"].iloc[0]
+    d  = df.groupby("Tier").agg(Sales=(pc,"sum")).reset_index()
+    d  = d[d["Tier"] != ""]
+    if d.empty: return None
+    return px.pie(d, values="Sales", names="Tier", title=f"{pc} by Tier",
+                  color_discrete_sequence=px.colors.qualitative.Set2, height=380)
 
-def create_growth_scatter(df: pd.DataFrame, periods: list):
-    """Primary vs comparison growth scatter."""
+def create_scatter_chart(df):
     import plotly.express as px
-    primary_col    = df['_primary_col'].iloc[0]    if '_primary_col'    in df.columns else 'Sales'
-    comparison_col = df['_comparison_col'].iloc[0] if '_comparison_col' in df.columns else 'Comparison'
-    if comparison_col not in df.columns:
-        return None
-    plot_df = df[(df[primary_col] > 0) | (df[comparison_col] > 0)].copy()
-    if plot_df.empty:
-        return None
-    fig = px.scatter(
-        plot_df, x=comparison_col, y=primary_col,
-        size=primary_col, color='Tier' if plot_df['Tier'].any() else None,
-        hover_name='Account', hover_data={'$ Change': True, '% Change': True},
-        title=f'{primary_col} vs {comparison_col}',
-        labels={comparison_col: f'{comparison_col} ($)', primary_col: f'{primary_col} ($)'}
-    )
-    max_val = max(plot_df[comparison_col].max(), plot_df[primary_col].max())
-    fig.add_shape(type='line', x0=0, y0=0, x1=max_val, y1=max_val,
-                  line=dict(color='gray', dash='dash'))
-    fig.update_layout(height=500)
+    pc = df["_primary_col"].iloc[0]; cc = df["_comparison_col"].iloc[0]
+    if cc not in df.columns: return None
+    plot_df = df[(df[pc]>0)|(df[cc]>0)].copy()
+    if plot_df.empty: return None
+    fig = px.scatter(plot_df, x=cc, y=pc, size=pc,
+                     color="Tier" if plot_df["Tier"].any() else None,
+                     hover_name="Account",
+                     hover_data={"$ Change":True,"% Change":True},
+                     title=f"{pc} vs {cc}", height=460)
+    mx = max(plot_df[cc].max(), plot_df[pc].max())
+    fig.add_shape(type="line", x0=0, y0=0, x1=mx, y1=mx,
+                  line=dict(color="gray", dash="dash"))
     return fig
 
 # =============================================================================
-# MAIN APPLICATION
+# PERIOD RESOLUTION
 # =============================================================================
+
+def _quarter_bounds(year, q):
+    starts = {1:(1,1), 2:(4,1), 3:(7,1), 4:(10,1)}
+    ends   = {1:(3,31),2:(6,30),3:(9,30),4:(12,31)}
+    s,e = starts[q],ends[q]
+    return datetime(year,s[0],s[1]).date(), datetime(year,e[0],e[1]).date()
+
+def resolve_primary_period(name, today, cy, cm, cq, cs=None, ce=None):
+    import calendar
+    if name == "This Month":
+        ld = calendar.monthrange(cy,cm)[1]
+        return datetime(cy,cm,1).strftime("%b %Y"), datetime(cy,cm,1).date(), min(datetime(cy,cm,ld).date(),today)
+    if name == "Last Month":
+        lm = cm-1 if cm>1 else 12; ly = cy if cm>1 else cy-1
+        ld = calendar.monthrange(ly,lm)[1]
+        return datetime(ly,lm,1).strftime("%b %Y"), datetime(ly,lm,1).date(), datetime(ly,lm,ld).date()
+    if name == "This Quarter":
+        s,e = _quarter_bounds(cy,cq)
+        return f"Q{cq} {cy}", s, min(e,today)
+    if name == "Last Quarter":
+        lq = cq-1 if cq>1 else 4; ly = cy if cq>1 else cy-1
+        s,e = _quarter_bounds(ly,lq)
+        return f"Q{lq} {ly}", s, e
+    if name == "Year to Date":
+        return f"{cy} YTD", datetime(cy,1,1).date(), today
+    if name == "Last 12 Months":
+        return "Last 12 Months", today.replace(year=today.year-1), today
+    if name == "This Year (Full)":
+        return str(cy), datetime(cy,1,1).date(), datetime(cy,12,31).date()
+    if name == "Last Year (Full)":
+        return str(cy-1), datetime(cy-1,1,1).date(), datetime(cy-1,12,31).date()
+    if name == "Last 30 Days":
+        return "Last 30 Days", today-timedelta(days=30), today
+    if name == "Last 60 Days":
+        return "Last 60 Days", today-timedelta(days=60), today
+    if name == "Last 90 Days":
+        return "Last 90 Days", today-timedelta(days=90), today
+    if name == "Custom Range":
+        s,e = cs or today, ce or today
+        return f"{s.strftime('%b %d')} - {e.strftime('%b %d, %Y')}", s, e
+    return f"{cy} YTD", datetime(cy,1,1).date(), today
+
+def same_period_prior_year(start, end):
+    try:
+        cs = start.replace(year=start.year-1)
+    except ValueError:
+        cs = start - timedelta(days=365)
+    try:
+        ce = end.replace(year=end.year-1)
+    except ValueError:
+        ce = end - timedelta(days=365)
+    return cs, ce
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
 def main():
     inject_css()
-    
-    # Header
+
+    # can_generate defined at function scope FIRST — permanent fix so it is
+    # always available to the Generate button regardless of sidebar execution.
+    can_generate = False
+
     st.markdown(f"""
     <div class="main-header">
         <h1>📊 {BRANDING['company_name']} Management Reports</h1>
-        <p style="color: #666;">Sales Intelligence Dashboard</p>
+        <p style="color:#666;margin:0.2rem 0 0;">Sales Intelligence Dashboard</p>
     </div>
     """, unsafe_allow_html=True)
-    
+
     # =========================================================================
-    # SIDEBAR - Configuration
+    # SIDEBAR
     # =========================================================================
     with st.sidebar:
-        st.header("⚙️ Data Sources")
+        st.header("⚙️ Configuration")
 
-        # Cin7 Credentials — pre-filled from Streamlit Secrets if set
         st.subheader("📦 Cin7 API")
         cin7_user = st.text_input("Username", value=get_secret("CIN7_USERNAME"), key="cin7_user")
-        cin7_key  = st.text_input("API Key",  value=get_secret("CIN7_API_KEY"), type="password", key="cin7_key")
-        
+        cin7_key  = st.text_input("API Key",  value=get_secret("CIN7_API_KEY"),
+                                   type="password", key="cin7_key")
+
+        # Overwrite the False set above — always runs before the button
+        can_generate = bool(cin7_user and cin7_key)
+
         if cin7_user and cin7_key:
             if st.button("Test Cin7", key="test_cin7"):
                 ok, msg = test_cin7_connection(cin7_user, cin7_key)
-                if ok: st.success(f"✅ {msg}")
-                else:  st.error(f"❌ {msg}")
-        
+                (st.success if ok else st.error)(f"{'OK' if ok else 'ERR'}: {msg}")
+
         st.divider()
-        
-        # HubSpot Credentials — pre-filled from Streamlit Secrets if set
+
         st.subheader("🟠 HubSpot API")
-        hubspot_key   = st.text_input("Private App Token", value=get_secret("HUBSPOT_API_KEY"), type="password", key="hubspot_key")
-        tier_property = st.text_input("Tier Property Name", value=get_secret("HUBSPOT_TIER_PROPERTY", "commission_tier"), key="tier_prop",
-                                       help="The internal name of your Tier property in HubSpot")
-        
+        hubspot_key   = st.text_input("Private App Token", value=get_secret("HUBSPOT_API_KEY"),
+                                       type="password", key="hubspot_key")
+        tier_property = st.text_input("Tier Property",
+                                       value=get_secret("HUBSPOT_TIER_PROPERTY","commission_tier"),
+                                       key="tier_prop")
+
         if hubspot_key:
             if st.button("Test HubSpot", key="test_hs"):
                 ok, msg = test_hubspot_connection(hubspot_key)
-                if ok: st.success(f"✅ {msg}")
-                else:  st.error(f"❌ {msg}")
-        
+                (st.success if ok else st.error)(f"{'OK' if ok else 'ERR'}: {msg}")
+
         st.divider()
 
-        # ── REPORT PERIOD ───────────────────────────────────────────────────
         st.subheader("📅 Report Period")
-
         today = datetime.now().date()
-        cy = today.year
-        cm = today.month
-
-        def quarter_of(month):
-            return (month - 1) // 3 + 1
-
-        cq = quarter_of(cm)
+        cy = today.year; cm = today.month; cq = (cm-1)//3+1
 
         PERIOD_OPTIONS = [
-            "This Month",
-            "Last Month",
-            "This Quarter",
-            "Last Quarter",
-            "Year to Date",
-            "Last 12 Months",
-            "This Year (Full)",
-            "Last Year (Full)",
-            "Last 30 Days",
-            "Last 60 Days",
-            "Last 90 Days",
-            "Custom Range",
+            "This Month","Last Month","This Quarter","Last Quarter",
+            "Year to Date","Last 12 Months","This Year (Full)","Last Year (Full)",
+            "Last 30 Days","Last 60 Days","Last 90 Days","Custom Range",
         ]
-
-        _cfg = st.session_state.config_loaded
-        _saved_period = _cfg.get("last_period", "Year to Date")
-        _saved_p_idx  = PERIOD_OPTIONS.index(_saved_period) if _saved_period in PERIOD_OPTIONS else 4
-
+        cfg          = st.session_state.config_loaded
+        saved_period = cfg.get("last_period", "Year to Date")
+        period_idx   = PERIOD_OPTIONS.index(saved_period) if saved_period in PERIOD_OPTIONS else 4
         selected_period = st.selectbox("Primary Period", PERIOD_OPTIONS,
-                                        index=_saved_p_idx, key="primary_period")
+                                        index=period_idx, key="primary_period")
 
-        custom_start, custom_end = None, None
+        custom_start = custom_end = None
         if selected_period == "Custom Range":
-            custom_start = st.date_input("From", value=datetime(cy, 1, 1).date(), key="custom_start")
-            custom_end   = st.date_input("To",   value=today, key="custom_end")
+            custom_start = st.date_input("From", value=datetime(cy,1,1).date(), key="custom_start")
+            custom_end   = st.date_input("To",   value=today,                   key="custom_end")
 
-        def get_quarter_bounds(year, q):
-            starts = {1: (1,1), 2: (4,1), 3: (7,1), 4: (10,1)}
-            ends   = {1: (3,31), 2: (6,30), 3: (9,30), 4: (12,31)}
-            s = starts[q]; e = ends[q]
-            return datetime(year, s[0], s[1]).date(), datetime(year, e[0], e[1]).date()
+        p_label, p_start, p_end = resolve_primary_period(
+            selected_period, today, cy, cm, cq, custom_start, custom_end)
 
-        def resolve_primary(period_name):
-            if period_name == "This Month":
-                import calendar
-                last_day = calendar.monthrange(cy, cm)[1]
-                return (datetime(cy, cm, 1).strftime("%b %Y"),
-                        datetime(cy, cm, 1).date(),
-                        min(datetime(cy, cm, last_day).date(), today))
-            elif period_name == "Last Month":
-                lm = cm - 1 if cm > 1 else 12
-                ly = cy if cm > 1 else cy - 1
-                import calendar
-                last_day = calendar.monthrange(ly, lm)[1]
-                return (datetime(ly, lm, 1).strftime("%b %Y"),
-                        datetime(ly, lm, 1).date(),
-                        datetime(ly, lm, last_day).date())
-            elif period_name == "This Quarter":
-                s, e = get_quarter_bounds(cy, cq)
-                return (f"Q{cq} {cy}", s, min(e, today))
-            elif period_name == "Last Quarter":
-                lq = cq - 1 if cq > 1 else 4
-                ly = cy if cq > 1 else cy - 1
-                s, e = get_quarter_bounds(ly, lq)
-                return (f"Q{lq} {ly}", s, e)
-            elif period_name == "Year to Date":
-                return (f"{cy} YTD", datetime(cy, 1, 1).date(), today)
-            elif period_name == "Last 12 Months":
-                return ("Last 12 Months", today.replace(year=today.year - 1), today)
-            elif period_name == "This Year (Full)":
-                return (str(cy), datetime(cy, 1, 1).date(), datetime(cy, 12, 31).date())
-            elif period_name == "Last Year (Full)":
-                return (str(cy - 1), datetime(cy-1, 1, 1).date(), datetime(cy-1, 12, 31).date())
-            elif period_name == "Last 30 Days":
-                return ("Last 30 Days", today - timedelta(days=30), today)
-            elif period_name == "Last 60 Days":
-                return ("Last 60 Days", today - timedelta(days=60), today)
-            elif period_name == "Last 90 Days":
-                return ("Last 90 Days", today - timedelta(days=90), today)
-            elif period_name == "Custom Range":
-                label = f"{custom_start.strftime('%b %d')} – {custom_end.strftime('%b %d, %Y')}" \
-                        if custom_start and custom_end else "Custom"
-                return (label, custom_start or today, custom_end or today)
+        COMPARE_OPTIONS = ["Same Period Last Year","Previous Period",
+                           "Custom Comparison Range","None"]
+        saved_compare = cfg.get("last_compare","Same Period Last Year")
+        compare_idx   = COMPARE_OPTIONS.index(saved_compare) if saved_compare in COMPARE_OPTIONS else 0
+        compare_to    = st.selectbox("Compare Against", COMPARE_OPTIONS,
+                                      index=compare_idx, key="compare_to")
 
-        # Resolve primary period first — comparison pickers need p_start/p_end as defaults
-        p_label, p_start, p_end = resolve_primary(selected_period)
-
-        def same_period_prior_year(start, end):
-            try:
-                cs = start.replace(year=start.year - 1)
-            except ValueError:
-                cs = start - timedelta(days=365)
-            try:
-                ce = end.replace(year=end.year - 1)
-            except ValueError:
-                ce = end - timedelta(days=365)
-            return cs, ce
-
-        # ── Compare Against ──────────────────────────────────────────
-        COMPARE_OPTIONS = [
-            "Same Period Last Year",
-            "Previous Period",
-            "Custom Comparison Range",
-            "None",
-        ]
-        _saved_compare = st.session_state.config_loaded.get("last_compare", "Same Period Last Year")
-        _saved_c_idx   = COMPARE_OPTIONS.index(_saved_compare) \
-                         if _saved_compare in COMPARE_OPTIONS else 0
-
-        compare_to = st.selectbox("Compare Against", COMPARE_OPTIONS,
-                                   index=_saved_c_idx, key="compare_to")
-
-        # Custom comparison date pickers — only shown when needed
-        comp_custom_start, comp_custom_end = None, None
+        comp_cs = comp_ce = None
         if compare_to == "Custom Comparison Range":
-            comp_custom_start = st.date_input(
-                "Compare From",
-                value=p_start.replace(year=p_start.year - 1),
-                key="comp_custom_start"
-            )
-            comp_custom_end = st.date_input(
-                "Compare To",
-                value=p_end.replace(year=p_end.year - 1),
-                key="comp_custom_end"
-            )
+            try:    dcs = p_start.replace(year=p_start.year-1)
+            except: dcs = p_start - timedelta(days=365)
+            try:    dce = p_end.replace(year=p_end.year-1)
+            except: dce = p_end - timedelta(days=365)
+            comp_cs = st.date_input("Compare From", value=dcs, key="comp_cstart")
+            comp_ce = st.date_input("Compare To",   value=dce, key="comp_cend")
 
-        # Resolve comparison period
+        comp = None
         if compare_to == "Same Period Last Year":
-            cs, ce  = same_period_prior_year(p_start, p_end)
+            cs, ce = same_period_prior_year(p_start, p_end)
             c_label = p_label.replace(str(p_start.year), str(cs.year)) \
                       if str(p_start.year) in p_label else f"{p_label} (Prior Year)"
             comp = (c_label, cs, ce)
-
         elif compare_to == "Previous Period":
             delta = p_end - p_start
-            ce    = p_start - timedelta(days=1)
-            cs    = ce - delta
-            c_label = f"{cs.strftime('%b %d')} – {ce.strftime('%b %d, %Y')}"
-            comp = (c_label, cs, ce)
+            ce = p_start - timedelta(days=1); cs = ce - delta
+            comp = (f"{cs.strftime('%b %d')} - {ce.strftime('%b %d, %Y')}", cs, ce)
+        elif compare_to == "Custom Comparison Range" and comp_cs and comp_ce:
+            comp = (f"{comp_cs.strftime('%b %d')} - {comp_ce.strftime('%b %d, %Y')}", comp_cs, comp_ce)
 
-        elif compare_to == "Custom Comparison Range":
-            if comp_custom_start and comp_custom_end:
-                c_label = f"{comp_custom_start.strftime('%b %d')} – {comp_custom_end.strftime('%b %d, %Y')}"
-                comp = (c_label, comp_custom_start, comp_custom_end)
-            else:
-                comp = None
-
-        else:  # None
-            comp = None
-
-        # Build periods list
         if comp:
-            periods = [
-                {"label": comp[0], "start": comp[1], "end": comp[2]},
-                {"label": p_label, "start": p_start, "end": p_end},
-            ]
+            periods = [{"label":comp[0],"start":comp[1],"end":comp[2]},
+                       {"label":p_label,"start":p_start,"end":p_end}]
         else:
-            periods = [
-                {"label": p_label, "start": p_start, "end": p_end},
-            ]
+            periods = [{"label":p_label,"start":p_start,"end":p_end}]
 
-        # Show resolved dates preview
-        st.caption(f"📅 **{p_label}:** {p_start.strftime('%b %d, %Y')} → {p_end.strftime('%b %d, %Y')}")
+        st.caption(f"📅 **{p_label}:** {p_start.strftime('%b %d, %Y')} to {p_end.strftime('%b %d, %Y')}")
         if comp:
-            p_days = (p_end - p_start).days + 1
-            c_days = (comp[2] - comp[1]).days + 1
-            st.caption(f"📅 **vs. {comp[0]}:** {comp[1].strftime('%b %d, %Y')} → {comp[2].strftime('%b %d, %Y')}")
-            if p_days == c_days:
-                st.caption(f"✅ {p_days}-day range, exact match")
-            else:
-                st.caption(f"ℹ️ {p_days}d vs {c_days}d")
+            pd_ = (p_end-p_start).days+1; cd_ = (comp[2]-comp[1]).days+1
+            st.caption(f"📅 **vs. {comp[0]}:** {comp[1].strftime('%b %d, %Y')} to {comp[2].strftime('%b %d, %Y')}")
+            st.caption(f"{'OK' if pd_==cd_ else 'NOTE'}: {pd_}d vs {cd_}d")
 
         st.divider()
-        st.subheader("🚫 Excluded Domains")
-        st.caption("Orders from these email domains are excluded (employees, internal).")
 
-        _excluded_cfg = load_config().get("excluded_domains", get_secret("EXCLUDED_DOMAINS", "vivantskincare.com"))
-        excluded_input = st.text_area(
-            "One domain per line",
-            value="\n".join(d.strip() for d in _excluded_cfg.split(",") if d.strip()),
-            height=80,
-            key="excluded_domains_input",
-            help="e.g. vivantskincare.com — any order with a matching customer email is excluded."
-        )
+        st.subheader("🚫 Excluded Domains")
+        _exc_raw = load_config().get("excluded_domains",
+                                      get_secret("EXCLUDED_DOMAINS","vivantskincare.com"))
+        excluded_input = st.text_area("One domain per line",
+            value="\n".join(d.strip() for d in _exc_raw.split(",") if d.strip()),
+            height=70, key="excluded_domains_input")
         if st.button("💾 Save Exclusions", use_container_width=True):
-            domains_csv = ", ".join(
-                d.strip().lower() for d in excluded_input.splitlines() if d.strip())
-            save_config({"excluded_domains": domains_csv})
+            save_config({"excluded_domains": ", ".join(
+                d.strip().lower() for d in excluded_input.splitlines() if d.strip())})
             cache_clear_all()
             st.session_state.report_data = None
-            st.success("Saved — run report to apply.")
+            st.success("Saved.")
             st.rerun()
 
-        # Cache status
-        meta = _load_cache_meta()
-        cached_periods = [v["label"] for k, v in meta.items() if k.startswith("cin7_")]
-        hs_entry = meta.get("hubspot")
+        meta           = _load_cache_meta()
+        cached_periods = [v["label"] for k,v in meta.items() if k.startswith("cin7_")]
+        hs_entry       = meta.get("hubspot")
+        contacts_entry = meta.get("contacts")
         if cached_periods:
-            age_info = ""
+            parts = [f"{len(cached_periods)} order period(s)"]
             if hs_entry:
-                hs_age = (datetime.now() - datetime.fromisoformat(hs_entry["saved_at"])).total_seconds() / 3600
-                age_info = f" · HubSpot {hs_age:.1f}h ago"
-            st.caption(f"💾 Cache: {len(cached_periods)} period(s){age_info}")
+                h = (datetime.now()-datetime.fromisoformat(hs_entry["saved_at"])).total_seconds()/3600
+                parts.append(f"HubSpot {h:.0f}h")
+            if contacts_entry:
+                h = (datetime.now()-datetime.fromisoformat(contacts_entry["saved_at"])).total_seconds()/3600
+                parts.append(f"Contacts {h:.0f}h")
+            st.caption("💾 " + " · ".join(parts))
             if st.button("🗑️ Clear Cache", use_container_width=True):
                 cache_clear_all()
                 st.session_state.report_data = None
+                st.session_state.cin7_customers = {}
                 st.rerun()
+
+        st.divider()
+
+        # ── AUTO-FETCH: trigger on load if secrets configured & no report yet ──
+        auto_fetch = (can_generate and
+                      st.session_state.report_data is None and
+                      all(cache_has_orders(p["label"]) for p in periods))
 
         if st.button("🔄 Generate Report", type="primary",
-                     use_container_width=True, disabled=not can_generate):
-            with st.spinner("Checking for updates..."):
-                progress_text = st.empty()
+                     use_container_width=True, disabled=not can_generate) or auto_fetch:
 
-                save_config({"last_period": selected_period, "last_compare": compare_to})
-                st.session_state.periods = periods
+            save_config({"last_period": selected_period, "last_compare": compare_to})
+            st.session_state.periods = periods
 
-                today = datetime.now().date()
-                all_orders   = []
-                cache_hits   = 0
-                cache_misses = 0
+            # If we have cached data for all periods, show it immediately
+            # while doing a background freshness check
+            has_all_cache = all(cache_has_orders(p["label"]) for p in periods)
 
-                # ── Per-period: probe → cache check → fetch if needed ──────
+            if has_all_cache and not auto_fetch:
+                # Show cached version instantly, then refresh
+                quick_orders = []
                 for p in periods:
-                    start_str = p["start"].strftime("%Y-%m-%dT00:00:00Z")
-                    end_str   = p["end"].strftime("%Y-%m-%dT23:59:59Z")
-                    label     = p["label"]
+                    cached = cache_load_orders_any(p["label"])
+                    if cached:
+                        quick_orders.extend(cached)
 
-                    # Closed period = end date is in the past; data is immutable
-                    is_closed = p["end"] < today
+                if quick_orders:
+                    # Build and display instantly from cache
+                    hs_tiers, hs_owners = cache_load_hubspot()
+                    hs_tiers  = hs_tiers  or {}
+                    hs_owners = hs_owners or {}
+                    customers = cache_load_contacts() or {}
+                    staff     = st.session_state.cin7_staff or {}
 
-                    if is_closed:
-                        # Try cache first — no probe needed for closed periods
-                        cached = cache_load_orders(label, "CLOSED")
-                        if cached is not None:
-                            all_orders.extend(cached)
-                            cache_hits += 1
-                            st.sidebar.success(f"✅ {label}: {len(cached)} orders (cached)")
-                            continue
+                    cdata, audit = aggregate_orders_by_company(
+                        quick_orders, periods, cin7_staff=staff)
+                    df_quick = build_report_dataframe(
+                        cdata, hs_tiers, periods, hs_owners, {},
+                        cin7_customers=customers)
 
-                    # Open (or no cache) → probe for fingerprint
-                    progress_text.text(f"Checking {label} for changes...")
-                    fingerprint = probe_cin7_fingerprint(
-                        cin7_user, cin7_key, start_str, end_str)
+                    if not df_quick.empty:
+                        st.session_state.report_data = df_quick
+                        st.session_state.audit       = audit
+                        st.session_state.periods     = periods
 
-                    cached = cache_load_orders(label, fingerprint)
-                    if cached is not None:
-                        all_orders.extend(cached)
-                        cache_hits += 1
-                        st.sidebar.success(f"✅ {label}: {len(cached)} orders (cached)")
-                    else:
-                        # Full fetch needed
-                        cache_misses += 1
-                        progress_text.text(f"Downloading {label} orders...")
-                        period_orders = fetch_orders_by_date_range(
-                            cin7_user, cin7_key, start_str, end_str, label=label,
-                            progress_callback=lambda msg: progress_text.text(msg)
-                        )
-                        cache_save_orders(label, period_orders,
-                                          "CLOSED" if is_closed else fingerprint)
-                        all_orders.extend(period_orders)
-                        st.sidebar.info(f"🔄 {label}: {len(period_orders)} orders (fresh)")
+            # Now do the real fetch (will update if data changed)
+            with st.spinner("Refreshing..."):
+                result = run_full_fetch(cin7_user, cin7_key, hubspot_key,
+                                        tier_property, periods)
+                st.session_state.report_data = result["df"]
+                st.session_state.audit       = result["audit"]
+                st.session_state.periods     = periods
+            st.rerun()
 
-                # ── HubSpot: TTL cache ──────────────────────────────────────
-                hubspot_tiers, company_owners = cache_load_hubspot()
-                owners_lookup = {}
+        elif auto_fetch:
+            # Build from cache immediately — no spinner, no wait
+            quick_orders = []
+            for p in periods:
+                cached = cache_load_orders_any(p["label"])
+                if cached:
+                    quick_orders.extend(cached)
+            if quick_orders:
+                hs_tiers, hs_owners = cache_load_hubspot()
+                customers = cache_load_contacts() or {}
+                staff     = st.session_state.cin7_staff or {}
+                cdata, audit = aggregate_orders_by_company(
+                    quick_orders, periods, cin7_staff=staff)
+                df_auto = build_report_dataframe(
+                    cdata, hs_tiers or {}, periods, hs_owners or {}, {},
+                    cin7_customers=customers)
+                if not df_auto.empty:
+                    st.session_state.report_data = df_auto
+                    st.session_state.audit       = audit
+                    st.session_state.periods     = periods
+                    st.rerun()
 
-                if hubspot_key:
-                    if hubspot_tiers is not None:
-                        st.sidebar.success(
-                            f"✅ HubSpot: {len(hubspot_tiers)} companies (cached)")
-                        owners_lookup = fetch_hubspot_owners(hubspot_key)
-                    else:
-                        progress_text.text("Fetching HubSpot data...")
-                        hubspot_tiers, company_owners = fetch_hubspot_company_data(
-                            hubspot_key, tier_property,
-                            progress_callback=lambda msg: progress_text.text(msg)
-                        )
-                        owners_lookup = fetch_hubspot_owners(hubspot_key)
-                        cache_save_hubspot(hubspot_tiers, company_owners)
-                        st.sidebar.info(
-                            f"🔄 HubSpot: {len(hubspot_tiers)} companies (fresh)")
-                else:
-                    hubspot_tiers  = {}
-                    company_owners = {}
-
-                # ── Build report ────────────────────────────────────────────
-                progress_text.text("Building report...")
-                company_data, audit = aggregate_orders_by_company(all_orders, periods)
-                df = build_report_dataframe(
-                    company_data, hubspot_tiers, periods, company_owners, owners_lookup)
-
-                st.session_state.report_data             = df
-                st.session_state.cin7_orders_cache       = all_orders
-                st.session_state.hubspot_companies_cache = hubspot_tiers
-                st.session_state.audit                   = audit
-
-                summary = f"✅ Done — {cache_hits} period(s) from cache, {cache_misses} refreshed"
-                progress_text.text(summary)
-                st.rerun()
-    
     # =========================================================================
     # MAIN CONTENT
     # =========================================================================
     df = st.session_state.report_data
 
-    # Guard: clear stale cache if it's missing required structural columns
-    REQUIRED_COLS = {'Account', '$ Change', '% Change', 'Tier', 'Sales Rep',
-                     '_primary_col', '_comparison_col'}
-    if df is not None and not REQUIRED_COLS.issubset(set(df.columns)):
+    REQUIRED = {"Account","$ Change","% Change","Tier","Sales Rep","_primary_col","_comparison_col"}
+    if df is not None and not REQUIRED.issubset(df.columns):
         st.session_state.report_data = None
         df = None
-    
+
     if df is None:
-        st.info("👈 Configure your API credentials and click **Generate Report** to get started.")
-        st.subheader("📋 What this report shows")
+        st.info("👈 Configure your API credentials and click **Generate Report** to begin.")
         st.markdown("""
         | Column | Description |
-        |--------|-------------|
+        |---|---|
         | **Account** | Company / account name |
-        | **YTD Sales** | Revenue for your selected primary period |
-        | **Prior Year Sales** | Revenue for the comparison period |
-        | **$ Change** | Dollar difference (YTD vs Prior) |
-        | **% Change** | Percentage growth or decline |
+        | **YTD Sales** | Revenue for selected primary period |
+        | **Prior Year** | Revenue for comparison period |
+        | **$ Change** | Dollar difference |
+        | **% Change** | Growth / decline % |
+        | **Type** | Account type from Cin7 (6%, 10%, HA) |
         | **Tier** | Commission tier from HubSpot |
-        | **Sales Rep** | Assigned sales representative |
+        | **Sales Rep** | Assigned rep from Cin7 Contacts |
         """)
         return
-    
-    # Derive actual column names from the dataframe
-    primary_col    = df['_primary_col'].iloc[0]    if '_primary_col'    in df.columns else 'Sales'
-    comparison_col = df['_comparison_col'].iloc[0] if '_comparison_col' in df.columns else 'Comparison'
 
-    # -------------------------------------------------------------------------
-    # FILTERS
-    # -------------------------------------------------------------------------
-    periods = st.session_state.get('periods', [])
+    primary_col = df["_primary_col"].iloc[0]
+    comp_col    = df["_comparison_col"].iloc[0]
+    periods     = st.session_state.get("periods", [])
 
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        all_reps = ['All'] + sorted([r for r in df['Sales Rep'].unique() if r])
-        selected_rep = st.selectbox("Sales Rep", all_reps)
-    with col2:
-        assigned_tiers = sorted([t for t in df['Tier'].unique() if t])
-        has_untiered   = df['Tier'].eq('').any() or df['Tier'].isna().any()
-        tier_options   = ['All'] + assigned_tiers + (['(No Tier)'] if has_untiered else [])
-        selected_tier  = st.selectbox("Tier", tier_options)
-    with col3:
-        min_ytd = st.number_input(f"Min {primary_col} ($)", min_value=0, value=0, step=500)
-    with col4:
-        sort_by = st.selectbox("Sort By", [
-            f"{primary_col} ↓", f"{comparison_col} ↓",
-            "% Change ↓", "% Change ↑", "Account A→Z"
-        ])
+    # ── Filters ───────────────────────────────────────────────────────────────
+    fc1, fc2, fc3, fc4, fc5 = st.columns(5)
+    with fc1:
+        reps = ["All"] + sorted([r for r in df["Sales Rep"].unique() if r])
+        selected_rep = st.selectbox("Sales Rep", reps)
+    with fc2:
+        tiers_list = sorted([t for t in df["Tier"].unique() if t])
+        has_no_tier = df["Tier"].eq("").any() or df["Tier"].isna().any()
+        selected_tier = st.selectbox("Tier", ["All"]+tiers_list+(["(No Tier)"] if has_no_tier else []))
+    with fc3:
+        types_list = sorted([t for t in df["Type"].unique() if t]) if "Type" in df.columns else []
+        has_no_type = (df["Type"].eq("").any() or df["Type"].isna().any()) if "Type" in df.columns else False
+        selected_type = st.selectbox("Type", ["All"]+types_list+(["(No Type)"] if has_no_type else []))
+    with fc4:
+        min_sales = st.number_input(f"Min {primary_col} ($)", min_value=0, value=0, step=500)
+    with fc5:
+        sort_options = [
+            f"{primary_col} down", f"{primary_col} up",
+            f"{comp_col} down", f"{comp_col} up",
+            "$ Change down", "$ Change up",
+            "% Change down", "% Change up",
+            "Account A-Z",
+        ]
+        sort_by = st.selectbox("Sort By", sort_options)
 
-    # Apply filters
-    filtered_df = df.copy()
-    if selected_rep  != 'All': filtered_df = filtered_df[filtered_df['Sales Rep'] == selected_rep]
-    if selected_tier == '(No Tier)':
-        filtered_df = filtered_df[filtered_df['Tier'].eq('') | filtered_df['Tier'].isna()]
-    elif selected_tier != 'All':
-        filtered_df = filtered_df[filtered_df['Tier'] == selected_tier]
-    if min_ytd > 0: filtered_df = filtered_df[filtered_df[primary_col] >= min_ytd]
+    fdf = df.copy()
+    if selected_rep  != "All": fdf = fdf[fdf["Sales Rep"]==selected_rep]
+    if selected_tier == "(No Tier)": fdf = fdf[fdf["Tier"].eq("")|fdf["Tier"].isna()]
+    elif selected_tier != "All":     fdf = fdf[fdf["Tier"]==selected_tier]
+    if "Type" in fdf.columns:
+        if selected_type == "(No Type)": fdf = fdf[fdf["Type"].eq("")|fdf["Type"].isna()]
+        elif selected_type != "All":     fdf = fdf[fdf["Type"]==selected_type]
+    if min_sales > 0: fdf = fdf[fdf[primary_col]>=min_sales]
 
     sort_map = {
-        f"{primary_col} ↓":    (primary_col,    False),
-        f"{comparison_col} ↓": (comparison_col, False),
-        "% Change ↓":          ("% Change",     False),
-        "% Change ↑":          ("% Change",     True),
-        "Account A→Z":         ("Account",      True),
+        f"{primary_col} down":(primary_col,False), f"{primary_col} up":(primary_col,True),
+        f"{comp_col} down":(comp_col,False),        f"{comp_col} up":(comp_col,True),
+        "$ Change down":("$ Change",False),          "$ Change up":("$ Change",True),
+        "% Change down":("% Change",False),          "% Change up":("% Change",True),
+        "Account A-Z":("Account",True),
     }
     scol, sasc = sort_map.get(sort_by, (primary_col, False))
-    if scol in filtered_df.columns:
-        filtered_df = filtered_df.sort_values(scol, ascending=sasc).reset_index(drop=True)
+    if scol in fdf.columns:
+        fdf = fdf.sort_values(scol, ascending=sasc).reset_index(drop=True)
 
-    # -------------------------------------------------------------------------
-    # SUMMARY METRICS
-    # -------------------------------------------------------------------------
+    # ── Summary metrics ────────────────────────────────────────────────────────
+    st.divider()
+    tp = fdf[primary_col].sum()
+    tc = fdf[comp_col].sum() if comp_col in fdf.columns else 0
+    td = fdf["$ Change"].sum()
+    tp_pct = ((tp-tc)/tc*100) if tc > 0 else 0
+    growing   = (fdf["% Change"]>0).sum()
+    declining = (fdf["% Change"]<0).sum()
+
+    m1,m2,m3,m4,m5,m6 = st.columns(6)
+    with m1: st.metric("Accounts",  f"{len(fdf):,}")
+    with m2: st.metric(primary_col, f"${tp:,.0f}")
+    with m3: st.metric(comp_col,    f"${tc:,.0f}")
+    with m4: st.metric("$ Change",  f"${td:+,.0f}")
+    with m5: st.metric("% Change",  f"{tp_pct:+.1f}%")
+    with m6: st.metric("Up / Down", f"{growing} / {declining}")
+
     st.divider()
 
-    total_primary    = filtered_df[primary_col].sum()
-    total_comparison = filtered_df[comparison_col].sum() if comparison_col in filtered_df.columns else 0
-    total_chg_d      = filtered_df['$ Change'].sum()
-    total_chg_p      = ((total_primary - total_comparison) / total_comparison * 100) \
-                        if total_comparison > 0 else 0
-    growing          = (filtered_df['% Change'] > 0).sum()
-    declining        = (filtered_df['% Change'] < 0).sum()
+    tab1, tab2, tab3, tab4 = st.tabs(
+        ["📋 Account Report","📈 Charts","📤 Export","🔍 Data Audit"])
 
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    with c1: st.metric("Accounts",        f"{len(filtered_df):,}")
-    with c2: st.metric(primary_col,       f"${total_primary:,.0f}")
-    with c3: st.metric(comparison_col,    f"${total_comparison:,.0f}")
-    with c4: st.metric("$ Change",        f"${total_chg_d:+,.0f}")
-    with c5: st.metric("% Change",        f"{total_chg_p:+.1f}%")
-    with c6: st.metric("↑ Growing  ↓ Declining", f"{growing}  /  {declining}")
-
-    # -------------------------------------------------------------------------
-    # TABS: Table | Charts | Export
-    # -------------------------------------------------------------------------
-    st.divider()
-    tab1, tab2, tab3, tab4 = st.tabs(["📋 Account Report", "📈 Charts", "📤 Export", "🔍 Data Audit"])
-
-    # ------------------------------------------------------------------
-    # TAB 1 — Account Report (exactly the 7 columns)
-    # ------------------------------------------------------------------
+    # TAB 1
     with tab1:
-        # ── Date range header ─────────────────────────────────────────
-        if len(periods) == 2:
-            pri = periods[1]; cmp = periods[0]
+        if len(periods)==2:
+            pri,cmp = periods[1],periods[0]
             st.markdown(
-                f"**{pri['label']}** &nbsp;·&nbsp; "
-                f"{pri['start'].strftime('%b %d, %Y')} — {pri['end'].strftime('%b %d, %Y')}"
-                f"&emsp;|&emsp;"
-                f"**vs. {cmp['label']}** &nbsp;·&nbsp; "
-                f"{cmp['start'].strftime('%b %d, %Y')} — {cmp['end'].strftime('%b %d, %Y')}",
-                unsafe_allow_html=True
-            )
-        elif len(periods) == 1:
+                f"**{pri['label']}** {pri['start'].strftime('%b %d, %Y')} to {pri['end'].strftime('%b %d, %Y')}"
+                f"  |  **vs. {cmp['label']}** {cmp['start'].strftime('%b %d, %Y')} to {cmp['end'].strftime('%b %d, %Y')}")
+        elif len(periods)==1:
             pri = periods[0]
-            st.markdown(
-                f"**{pri['label']}** &nbsp;·&nbsp; "
-                f"{pri['start'].strftime('%b %d, %Y')} — {pri['end'].strftime('%b %d, %Y')}"
-            )
-        st.caption(f"{len(filtered_df)} accounts")
+            st.markdown(f"**{pri['label']}** {pri['start'].strftime('%b %d, %Y')} to {pri['end'].strftime('%b %d, %Y')}")
+        st.caption(f"{len(fdf)} accounts")
 
-        # ── Build display rows ────────────────────────────────────────
-        display_cols = ['Account', primary_col, comparison_col, '$ Change', '% Change', 'Tier', 'Sales Rep']
-        display_cols = [c for c in display_cols if c in filtered_df.columns]
-        display_df   = filtered_df[display_cols].copy()
+        display_cols = [c for c in ["Account",primary_col,comp_col,"$ Change","% Change",
+                                     "Type","Tier","Sales Rep"] if c in fdf.columns]
+        col_cfg = {
+            "Account":   st.column_config.TextColumn("Account", width="medium"),
+            primary_col: st.column_config.NumberColumn(primary_col, format="$%.2f", width="small"),
+            "$ Change":  st.column_config.NumberColumn("$ Change",  format="$%.2f", width="small"),
+            "% Change":  st.column_config.NumberColumn("% Change",  format="%.1f%%", width="small"),
+            "Type":      st.column_config.TextColumn("Type",       width="small"),
+            "Tier":      st.column_config.TextColumn("Tier",       width="small"),
+            "Sales Rep": st.column_config.TextColumn("Sales Rep",  width="small"),
+        }
+        if comp_col in fdf.columns:
+            col_cfg[comp_col] = st.column_config.NumberColumn(comp_col, format="$%.2f", width="small")
 
-        display_df[primary_col]    = display_df[primary_col].apply(lambda x: f"${x:,.2f}")
-        if comparison_col in display_df.columns:
-            display_df[comparison_col] = display_df[comparison_col].apply(lambda x: f"${x:,.2f}")
-        display_df['$ Change']     = display_df['$ Change'].apply(
-            lambda x: f"+${x:,.2f}" if x >= 0 else f"-${abs(x):,.2f}")
-        display_df['% Change']     = display_df['% Change'].apply(lambda x: f"{x:+.1f}%")
+        st.dataframe(fdf[display_cols], use_container_width=True, hide_index=True,
+                     column_config=col_cfg,
+                     height=min(600, (len(fdf)+1)*35+38))
 
-        st.dataframe(display_df, use_container_width=True, hide_index=True,
-                     height=min(600, (len(display_df) + 1) * 35 + 38))
-
-    # ------------------------------------------------------------------
-    # TAB 2 — Charts
-    # ------------------------------------------------------------------
+    # TAB 2
     with tab2:
         st.subheader("📈 Visual Analytics")
-        if len(filtered_df) > 0:
-            st.plotly_chart(create_yoy_chart(filtered_df, periods), use_container_width=True)
-
-        col1, col2 = st.columns(2)
-        with col1:
-            if filtered_df['Sales Rep'].any():
-                fig = create_rep_performance_chart(filtered_df)
-                if fig: st.plotly_chart(fig, use_container_width=True)
-        with col2:
-            if filtered_df['Tier'].any():
-                fig = create_tier_breakdown_chart(filtered_df)
-                if fig: st.plotly_chart(fig, use_container_width=True)
-
-        fig = create_growth_scatter(filtered_df, periods)
+        if not fdf.empty:
+            st.plotly_chart(create_yoy_chart(fdf), use_container_width=True)
+        cc1,cc2 = st.columns(2)
+        with cc1:
+            fig = create_rep_chart(fdf)
+            if fig: st.plotly_chart(fig, use_container_width=True)
+        with cc2:
+            fig = create_tier_chart(fdf)
+            if fig: st.plotly_chart(fig, use_container_width=True)
+        fig = create_scatter_chart(fdf)
         if fig:
             st.plotly_chart(fig, use_container_width=True)
-            st.caption("📍 Accounts above the line are growing YTD vs prior year; below are declining")
+            st.caption("Accounts above the diagonal are growing; below are declining.")
 
-    # ------------------------------------------------------------------
-    # TAB 3 — Export
-    # ------------------------------------------------------------------
+    # TAB 3
     with tab3:
         st.subheader("📤 Export Report")
-        export_cols = ['Account', primary_col, comparison_col, '$ Change', '% Change', 'Tier', 'Sales Rep']
-        export_cols = [c for c in export_cols if c in filtered_df.columns]
-        export_df   = filtered_df[export_cols].copy()
-
-        col1, col2 = st.columns(2)
-        with col1:
+        export_cols = [c for c in ["Account",primary_col,comp_col,"$ Change","% Change",
+                                    "Type","Tier","Sales Rep"] if c in fdf.columns]
+        export_df = fdf[export_cols].copy()
+        ec1,ec2 = st.columns(2)
+        with ec1:
             st.markdown("### Excel")
             st.write(f"{len(export_df)} accounts")
-            excel_data = export_to_excel(export_df)
-            st.download_button(
-                label="⬇️ Download Excel",
-                data=excel_data,
+            st.download_button("Download Excel", data=export_to_excel(export_df),
                 file_name=f"sales_report_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-        with col2:
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        with ec2:
             st.markdown("### CSV")
             st.write(f"{len(export_df)} accounts")
-            st.download_button(
-                label="⬇️ Download CSV",
-                data=export_df.to_csv(index=False),
+            st.download_button("Download CSV", data=export_df.to_csv(index=False),
                 file_name=f"sales_report_{datetime.now().strftime('%Y%m%d')}.csv",
-                mime="text/csv"
-            )
+                mime="text/csv")
 
-    # ------------------------------------------------------------------
-    # TAB 4 — Data Audit
-    # ------------------------------------------------------------------
+    # TAB 4
     with tab4:
-        audit = st.session_state.get('audit')
+        audit = st.session_state.get("audit")
         if not audit:
-            st.info("Run a report first to see the data audit.")
+            st.info("Run a report to see the data audit.")
         else:
-            st.subheader("🔍 Data Audit — What Was Imported")
-
-            # ── Top-level order counts ────────────────────────────────
-            total   = audit['total_raw']
-            kept    = audit['included']
-            dropped = total - kept
-
-            c1, c2, c3, c4 = st.columns(4)
-            with c1: st.metric("Raw Orders Fetched",  f"{total:,}")
-            with c2: st.metric("Included in Report",  f"{kept:,}",
-                                delta=f"{kept/total*100:.1f}% of total" if total else "0%")
-            with c3: st.metric("Dropped / Excluded",  f"{dropped:,}",
+            st.subheader("🔍 Data Audit")
+            total = audit["total_raw"]; kept = audit["included"]; dropped = total-kept
+            a1,a2,a3,a4 = st.columns(4)
+            with a1: st.metric("Raw Orders",       f"{total:,}")
+            with a2: st.metric("Included",         f"{kept:,}",
+                                delta=f"{kept/total*100:.1f}%" if total else "0%")
+            with a3: st.metric("Excluded",         f"{dropped:,}",
                                 delta=f"-{dropped/total*100:.1f}%" if total else "0%",
                                 delta_color="inverse")
-            with c4: st.metric("Unique Companies",    f"{audit.get('unique_companies', 0):,}")
+            with a4: st.metric("Unique Companies", f"{audit.get('unique_companies',0):,}")
 
-            # Untiered accounts callout
-            if df is not None and 'Tier' in df.columns:
-                untiered = df['Tier'].eq('').sum() + df['Tier'].isna().sum()
+            if "Tier" in df.columns:
+                untiered = df["Tier"].eq("").sum() + df["Tier"].isna().sum()
                 if untiered:
-                    st.warning(f"⚠️ **{untiered} accounts** have no HubSpot tier assigned. "
-                               f"Use the **Tier → (No Tier)** filter to view them.")
+                    st.warning(f"{untiered} accounts have no HubSpot tier assigned.")
 
             st.divider()
-
-            # ── Breakdown by exclusion reason ─────────────────────────
-            st.markdown("#### Why Orders Were Excluded")
-            excl_data = {
-                "Reason": [
-                    "Shopify / Retail channel (B2C)",
-                    "Excluded email domain (employees)",
-                    "Outside selected date windows",
-                    "$0 total orders",
-                    "No company name (mapped to 'Unknown')",
-                ],
-                "Count": [
-                    audit['excluded_source'],
-                    audit.get('excluded_domain', 0),
-                    audit['excluded_no_period'],
-                    audit['excluded_zero_total'],
-                    audit['unknown_company'],
-                ]
-            }
-            excl_df = pd.DataFrame(excl_data)
-            excl_df['% of Raw'] = excl_df['Count'].apply(
+            st.markdown("#### Exclusion Breakdown")
+            excl_df = pd.DataFrame({
+                "Reason":["Shopify/Retail (B2C)","Excluded email domain","Outside date windows",
+                           "$0 total","No company name"],
+                "Count": [audit["excluded_source"], audit.get("excluded_domain",0),
+                           audit["excluded_no_period"], audit["excluded_zero_total"],
+                           audit["unknown_company"]],
+            })
+            excl_df["% of Raw"] = excl_df["Count"].apply(
                 lambda x: f"{x/total*100:.1f}%" if total else "0%")
             st.dataframe(excl_df, use_container_width=True, hide_index=True)
 
-            if audit.get('excluded_domain_counts'):
-                st.markdown("#### Excluded by Email Domain")
-                dom_df = pd.DataFrame([
-                    {"Domain": k, "Orders Dropped": v}
-                    for k, v in sorted(audit['excluded_domain_counts'].items(),
-                                       key=lambda x: -x[1])
-                ])
-                st.dataframe(dom_df, use_container_width=True, hide_index=True)
-                st.caption("Manage domains in the sidebar under **🚫 Excluded Domains**.")
+            if audit.get("excluded_domain_counts"):
+                st.markdown("#### Excluded by Domain")
+                st.dataframe(pd.DataFrame([{"Domain":k,"Dropped":v} for k,v in
+                    sorted(audit["excluded_domain_counts"].items(),key=lambda x:-x[1])]),
+                    use_container_width=True, hide_index=True)
 
-            # ── Source values that triggered exclusion ────────────────
-            if audit['excluded_sources']:
-                st.markdown("#### Excluded Source Values (from Cin7 `source` field)")
-                src_df = pd.DataFrame([
-                    {"Source Value": k, "Orders Dropped": v}
-                    for k, v in sorted(audit['excluded_sources'].items(),
-                                       key=lambda x: -x[1])
-                ])
-                st.dataframe(src_df, use_container_width=True, hide_index=True)
-                st.caption("⚠️ If any of these sources should be included in B2B wholesale revenue, "
-                           "let Sam know to adjust the source filter logic.")
+            if audit["excluded_sources"]:
+                st.markdown("#### Excluded Source Values")
+                st.dataframe(pd.DataFrame([{"Source":k,"Dropped":v} for k,v in
+                    sorted(audit["excluded_sources"].items(),key=lambda x:-x[1])]),
+                    use_container_width=True, hide_index=True)
 
             st.divider()
+            st.markdown("#### By Period")
+            st.dataframe(pd.DataFrame([
+                {"Period":lbl,"Included":s["included"],
+                 "Revenue":f"${s['revenue']:,.2f}","Excluded B2C":s["excluded_source"]}
+                for lbl,s in audit["by_period"].items()
+            ]), use_container_width=True, hide_index=True)
 
-            # ── Per-period breakdown ──────────────────────────────────
-            st.markdown("#### Orders & Revenue by Period")
-            period_rows = []
-            for lbl, stats in audit['by_period'].items():
-                period_rows.append({
-                    "Period":           lbl,
-                    "Included Orders":  stats['included'],
-                    "Revenue":          f"${stats['revenue']:,.2f}",
-                    "Excluded (B2C)":   stats['excluded_source'],
-                })
-            st.dataframe(pd.DataFrame(period_rows), use_container_width=True, hide_index=True)
-
-            st.divider()
-
-            # ── Sample excluded orders ────────────────────────────────
-            if audit['sample_excluded']:
-                st.markdown("#### Sample Excluded Orders (first 10)")
-                st.dataframe(pd.DataFrame(audit['sample_excluded']),
+            if audit["sample_excluded"]:
+                st.divider()
+                st.markdown("#### Sample Excluded Orders")
+                st.dataframe(pd.DataFrame(audit["sample_excluded"]),
                              use_container_width=True, hide_index=True)
 
     st.markdown("---")
     st.markdown(
-        f"<p style='text-align: center; color: #666; font-size: 0.8rem;'>Powered by {BRANDING['company_name']} | 📊 Management Reports</p>",
-        unsafe_allow_html=True
-    )
+        f"<p style='text-align:center;color:#888;font-size:0.75rem;'>"
+        f"Powered by {BRANDING['company_name']}</p>",
+        unsafe_allow_html=True)
 
-if __name__ == "__main__":
-    main()
+
+# =============================================================================
+# ENTRY POINT  (unconditional -- Streamlit imports this module)
+# =============================================================================
+main()
