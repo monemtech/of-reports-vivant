@@ -275,15 +275,16 @@ def _fetch_page(username: str, api_key: str, start: str, end: str,
             params=params,
             timeout=60,
         )
-        # Store debug info for first page
+        # Store debug info for first page to a file (session_state not safe from threads)
         if page == 1:
             try:
-                import streamlit as _st
-                _st.session_state["_api_debug"] = {
-                    "status_code": r.status_code,
-                    "url": r.url,
-                    "response_preview": str(r.text[:500]),
-                }
+                with open(".cin7_api_debug.json", "w") as _f:
+                    json.dump({
+                        "status_code": r.status_code,
+                        "url": r.url,
+                        "params_sent": params,
+                        "response_preview": r.text[:1000],
+                    }, _f)
             except Exception:
                 pass
         if r.status_code in (400, 422) and use_fields:
@@ -301,8 +302,8 @@ def _fetch_page(username: str, api_key: str, start: str, end: str,
         return orders, hit_end
     except Exception as ex:
         try:
-            import streamlit as _st
-            _st.session_state["_api_debug"] = {"exception": str(ex)}
+            with open(".cin7_api_debug.json", "w") as _f:
+                json.dump({"exception": str(ex)}, _f)
         except Exception:
             pass
         return [], True
@@ -1198,6 +1199,15 @@ def main():
             if api_debug:
                 st.subheader("🌐 Cin7 API Response")
                 st.json(api_debug)
+            # Also try reading from file
+            try:
+                import json as _json
+                with open(".cin7_api_debug.json") as _f:
+                    file_debug = _json.load(_f)
+                st.subheader("🌐 Cin7 API Response (from file)")
+                st.json(file_debug)
+            except Exception:
+                st.warning("No API debug file found yet — fetch may not have reached the API call.")
             st.divider()
 
         audit = st.session_state.get("audit")
