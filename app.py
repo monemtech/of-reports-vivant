@@ -682,8 +682,8 @@ def run_full_fetch(cin7_user: str, cin7_key: str, hubspot_key: str,
 
     # ── Step 1: For each period, decide probe or use CLOSED shortcut ──────────
     def _probe_or_skip(p, user, key):
-        s  = p["start"].strftime("%Y-%m-%dT00:00:00Z")
-        e  = p["end"].strftime("%Y-%m-%dT23:59:59Z")
+        s  = p["start"].strftime("%Y-%m-%d")
+        e  = p["end"].strftime("%Y-%m-%d")
         fp = "CLOSED" if p["end"] < today_dt else probe_cin7_fingerprint(user, key, s, e)
         return p, s, e, fp
 
