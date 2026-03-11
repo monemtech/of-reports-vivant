@@ -70,6 +70,18 @@ def get_secret(key: str, default: str = "") -> str:
     except Exception:
         return default
 
+def get_excluded_domains() -> set:
+    """
+    Load email domains whose orders should be excluded (employees, internal accounts).
+    Priority: config file (saved via sidebar) → Streamlit secrets → default.
+    Example: "vivantskincare.com, monemtech.com"
+    Always lowercase.
+    """
+    raw = load_config().get("excluded_domains", "") or get_secret("EXCLUDED_DOMAINS", "")
+    if not raw:
+        return set()
+    return {d.strip().lower() for d in raw.split(",") if d.strip()}
+
 # =============================================================================
 # DISK CACHE  (orders + HubSpot)
 # =============================================================================
@@ -266,7 +278,7 @@ def probe_cin7_fingerprint(username: str, api_key: str,
 
 # Only fetch the fields we actually use — cuts payload by ~85%
 # NOTE: if Cin7 rejects the fields param, we fall back to full fetch automatically
-CIN7_FIELDS = "id,company,billingCompany,firstName,lastName,total,createdDate,modifiedDate,salesPersonEmail,source"
+CIN7_FIELDS = "id,company,billingCompany,firstName,lastName,email,total,createdDate,modifiedDate,salesPersonEmail,source"
 
 def fetch_orders_by_date_range(username: str, api_key: str,
                                start_date: str, end_date: str,
@@ -351,11 +363,13 @@ def fetch_all_periods_parallel(username: str, api_key: str, periods: list,
 def aggregate_orders_by_company(orders: list, periods: list) -> tuple:
     """
     Aggregate orders by company name across dynamic periods.
+    Excludes:
+      - Retail / Shopify channel orders (B2C)
+      - Orders where the customer email matches an excluded domain (employees)
     Returns: (company_data dict, audit dict)
-
-    company_data: {company_name: {period_label: total, 'rep': ..., 'order_count': ...}}
-    audit: detailed breakdown of what was included vs excluded and why
     """
+    excluded_domains = get_excluded_domains()
+
     def get_period_label(date_str):
         if not date_str:
             return None
@@ -368,40 +382,46 @@ def aggregate_orders_by_company(orders: list, periods: list) -> tuple:
                 return p["label"]
         return None
 
+    def email_domain(email: str) -> str:
+        email = (email or '').strip().lower()
+        return email.split('@')[-1] if '@' in email else ''
+
     company_data  = {}
     period_labels = [p["label"] for p in periods]
 
-    # Audit counters
     audit = {
-        "total_raw":            len(orders),
-        "included":             0,
-        "excluded_source":      0,         # shopify / retail
-        "excluded_no_period":   0,         # outside all date windows
-        "excluded_zero_total":  0,         # $0 orders
-        "unknown_company":      0,         # no company name resolved
-        "by_period":            {lbl: {"included": 0, "excluded_source": 0,
-                                        "revenue": 0.0} for lbl in period_labels},
-        "excluded_sources":     {},        # tally of which source values were dropped
-        "sample_excluded":      [],        # up to 10 example dropped orders
+        "total_raw":               len(orders),
+        "included":                0,
+        "excluded_source":         0,
+        "excluded_domain":         0,
+        "excluded_no_period":      0,
+        "excluded_zero_total":     0,
+        "unknown_company":         0,
+        "by_period":               {lbl: {"included": 0, "excluded_source": 0,
+                                           "revenue": 0.0} for lbl in period_labels},
+        "excluded_sources":        {},
+        "excluded_domain_counts":  {},   # domain → order count
+        "sample_excluded":         [],
     }
 
     for order in orders:
         company = (order.get('company') or order.get('billingCompany') or '').strip()
         if not company:
-            first = order.get('firstName', '')
-            last  = order.get('lastName', '')
+            first   = order.get('firstName', '')
+            last    = order.get('lastName', '')
             company = f"{first} {last}".strip() or 'Unknown'
             if company == 'Unknown':
                 audit["unknown_company"] += 1
 
         total        = float(order.get('total') or 0)
         rep_email    = (order.get('salesPersonEmail') or '').strip()
+        cust_email   = (order.get('email') or '').strip()
         created_date = order.get('createdDate', '')
         period_label = get_period_label(created_date)
         source       = (order.get('source') or '').strip()
         source_lower = source.lower()
 
-        # Check exclusion reasons
+        # ── Exclude: retail / Shopify ──────────────────────────────────
         if 'shopify' in source_lower or 'retail' in source_lower:
             audit["excluded_source"] += 1
             audit["excluded_sources"][source] = audit["excluded_sources"].get(source, 0) + 1
@@ -409,20 +429,30 @@ def aggregate_orders_by_company(orders: list, periods: list) -> tuple:
                 audit["by_period"][period_label]["excluded_source"] += 1
             if len(audit["sample_excluded"]) < 10:
                 audit["sample_excluded"].append({
-                    "reason": f"source={source}",
-                    "company": company,
-                    "total": total,
-                    "date": created_date[:10] if created_date else "",
-                })
+                    "reason": f"source={source}", "company": company,
+                    "total": total, "date": created_date[:10] if created_date else ""})
             continue
 
+        # ── Exclude: employee email domains ───────────────────────────
+        domain = email_domain(cust_email)
+        if excluded_domains and domain in excluded_domains:
+            audit["excluded_domain"] += 1
+            audit["excluded_domain_counts"][domain] = \
+                audit["excluded_domain_counts"].get(domain, 0) + 1
+            if len(audit["sample_excluded"]) < 10:
+                audit["sample_excluded"].append({
+                    "reason": f"excluded domain ({domain})", "company": company,
+                    "email": cust_email, "total": total,
+                    "date": created_date[:10] if created_date else ""})
+            continue
+
+        # ── Exclude: outside date windows ─────────────────────────────
         if period_label is None or period_label not in period_labels:
             audit["excluded_no_period"] += 1
             continue
 
         if total == 0:
             audit["excluded_zero_total"] += 1
-            # still count the company but don't add revenue
 
         if company not in company_data:
             company_data[company] = {'rep': rep_email, 'order_count': 0}
@@ -900,22 +930,13 @@ def main():
             "Custom Range",
         ]
 
-        # Load last used preferences
         _cfg = st.session_state.config_loaded
-        _saved_period  = _cfg.get("last_period", "Year to Date")
-        _saved_compare = _cfg.get("last_compare", "Same Period Last Year")
-        _saved_p_idx   = PERIOD_OPTIONS.index(_saved_period) if _saved_period in PERIOD_OPTIONS else 4
-        _compare_opts  = ["Same Period Last Year", "Previous Period", "None"]
-        _saved_c_idx   = _compare_opts.index(_saved_compare) if _saved_compare in _compare_opts else 0
+        _saved_period = _cfg.get("last_period", "Year to Date")
+        _saved_p_idx  = PERIOD_OPTIONS.index(_saved_period) if _saved_period in PERIOD_OPTIONS else 4
 
         selected_period = st.selectbox("Primary Period", PERIOD_OPTIONS,
                                         index=_saved_p_idx, key="primary_period")
 
-        compare_options = ["Same Period Last Year", "Previous Period", "None"]
-        compare_to = st.selectbox("Compare Against", compare_options,
-                                   index=_saved_c_idx, key="compare_to")
-
-        # Custom range inputs — only shown when needed
         custom_start, custom_end = None, None
         if selected_period == "Custom Range":
             custom_start = st.date_input("From", value=datetime(cy, 1, 1).date(), key="custom_start")
@@ -928,25 +949,20 @@ def main():
             return datetime(year, s[0], s[1]).date(), datetime(year, e[0], e[1]).date()
 
         def resolve_primary(period_name):
-            """Return (label, start, end) for the selected primary period."""
             if period_name == "This Month":
                 import calendar
                 last_day = calendar.monthrange(cy, cm)[1]
-                return (
-                    datetime(cy, cm, 1).strftime("%b %Y"),
-                    datetime(cy, cm, 1).date(),
-                    min(datetime(cy, cm, last_day).date(), today)
-                )
+                return (datetime(cy, cm, 1).strftime("%b %Y"),
+                        datetime(cy, cm, 1).date(),
+                        min(datetime(cy, cm, last_day).date(), today))
             elif period_name == "Last Month":
                 lm = cm - 1 if cm > 1 else 12
                 ly = cy if cm > 1 else cy - 1
                 import calendar
                 last_day = calendar.monthrange(ly, lm)[1]
-                return (
-                    datetime(ly, lm, 1).strftime("%b %Y"),
-                    datetime(ly, lm, 1).date(),
-                    datetime(ly, lm, last_day).date()
-                )
+                return (datetime(ly, lm, 1).strftime("%b %Y"),
+                        datetime(ly, lm, 1).date(),
+                        datetime(ly, lm, last_day).date())
             elif period_name == "This Quarter":
                 s, e = get_quarter_bounds(cy, cq)
                 return (f"Q{cq} {cy}", s, min(e, today))
@@ -958,9 +974,7 @@ def main():
             elif period_name == "Year to Date":
                 return (f"{cy} YTD", datetime(cy, 1, 1).date(), today)
             elif period_name == "Last 12 Months":
-                return ("Last 12 Months",
-                        (today.replace(year=today.year - 1)),
-                        today)
+                return ("Last 12 Months", today.replace(year=today.year - 1), today)
             elif period_name == "This Year (Full)":
                 return (str(cy), datetime(cy, 1, 1).date(), datetime(cy, 12, 31).date())
             elif period_name == "Last Year (Full)":
@@ -976,83 +990,114 @@ def main():
                         if custom_start and custom_end else "Custom"
                 return (label, custom_start or today, custom_end or today)
 
-        def resolve_comparison(primary_label, primary_start, primary_end, compare_name):
-            """Return (label, start, end) for the comparison period — exact apples-to-apples."""
-            if compare_name == "None":
-                return None
-
-            delta = primary_end - primary_start
-
-            if compare_name == "Same Period Last Year":
-                try:
-                    cs = primary_start.replace(year=primary_start.year - 1)
-                    ce = primary_end.replace(year=primary_end.year - 1)
-                except ValueError:
-                    # Feb 29 edge case
-                    cs = primary_start - timedelta(days=365)
-                    ce = primary_end   - timedelta(days=365)
-
-                # Always derive label from the ACTUAL comparison dates, not the primary label
-                # so "Feb 2026" → "Feb 2025", "Q1 2026" → "Q1 2025", "2026 YTD" → "2025 YTD"
-                if "YTD" in primary_label:
-                    lbl = primary_label.replace(str(primary_start.year), str(cs.year))
-                elif primary_label.startswith("Q"):
-                    # e.g. "Q1 2026" → "Q1 2025"
-                    parts = primary_label.split()
-                    lbl = f"{parts[0]} {cs.year}"
-                elif "Last 12 Months" in primary_label:
-                    lbl = "Prior 12 Months"
-                elif "Last 30 Days" in primary_label:
-                    lbl = "Prior 30 Days"
-                elif "Last 60 Days" in primary_label:
-                    lbl = "Prior 60 Days"
-                elif "Last 90 Days" in primary_label:
-                    lbl = "Prior 90 Days"
-                else:
-                    # Month name e.g. "Feb 2026" → "Feb 2025"
-                    # or full year "2026" → "2025"
-                    lbl = primary_label.replace(str(primary_start.year), str(cs.year))
-
-                return (lbl, cs, ce)
-
-            elif compare_name == "Previous Period":
-                ce = primary_start - timedelta(days=1)
-                cs = ce - delta
-                lbl = f"{cs.strftime('%b %d')} – {ce.strftime('%b %d, %Y')}"
-                return (lbl, cs, ce)
-
-        # Resolve the periods — primary + comparison only, no auto-inserted 3rd period
+        # Resolve primary period first — comparison pickers need p_start/p_end as defaults
         p_label, p_start, p_end = resolve_primary(selected_period)
-        comp = resolve_comparison(p_label, p_start, p_end, compare_to)
 
+        def same_period_prior_year(start, end):
+            try:
+                cs = start.replace(year=start.year - 1)
+            except ValueError:
+                cs = start - timedelta(days=365)
+            try:
+                ce = end.replace(year=end.year - 1)
+            except ValueError:
+                ce = end - timedelta(days=365)
+            return cs, ce
+
+        # ── Compare Against ──────────────────────────────────────────
+        COMPARE_OPTIONS = [
+            "Same Period Last Year",
+            "Previous Period",
+            "Custom Comparison Range",
+            "None",
+        ]
+        _saved_compare = st.session_state.config_loaded.get("last_compare", "Same Period Last Year")
+        _saved_c_idx   = COMPARE_OPTIONS.index(_saved_compare) \
+                         if _saved_compare in COMPARE_OPTIONS else 0
+
+        compare_to = st.selectbox("Compare Against", COMPARE_OPTIONS,
+                                   index=_saved_c_idx, key="compare_to")
+
+        # Custom comparison date pickers — only shown when needed
+        comp_custom_start, comp_custom_end = None, None
+        if compare_to == "Custom Comparison Range":
+            comp_custom_start = st.date_input(
+                "Compare From",
+                value=p_start.replace(year=p_start.year - 1),
+                key="comp_custom_start"
+            )
+            comp_custom_end = st.date_input(
+                "Compare To",
+                value=p_end.replace(year=p_end.year - 1),
+                key="comp_custom_end"
+            )
+
+        # Resolve comparison period
+        if compare_to == "Same Period Last Year":
+            cs, ce  = same_period_prior_year(p_start, p_end)
+            c_label = p_label.replace(str(p_start.year), str(cs.year)) \
+                      if str(p_start.year) in p_label else f"{p_label} (Prior Year)"
+            comp = (c_label, cs, ce)
+
+        elif compare_to == "Previous Period":
+            delta = p_end - p_start
+            ce    = p_start - timedelta(days=1)
+            cs    = ce - delta
+            c_label = f"{cs.strftime('%b %d')} – {ce.strftime('%b %d, %Y')}"
+            comp = (c_label, cs, ce)
+
+        elif compare_to == "Custom Comparison Range":
+            if comp_custom_start and comp_custom_end:
+                c_label = f"{comp_custom_start.strftime('%b %d')} – {comp_custom_end.strftime('%b %d, %Y')}"
+                comp = (c_label, comp_custom_start, comp_custom_end)
+            else:
+                comp = None
+
+        else:  # None
+            comp = None
+
+        # Build periods list
         if comp:
             periods = [
                 {"label": comp[0], "start": comp[1], "end": comp[2]},
-                {"label": p_label,  "start": p_start,  "end": p_end},
+                {"label": p_label, "start": p_start, "end": p_end},
             ]
         else:
             periods = [
                 {"label": p_label, "start": p_start, "end": p_end},
             ]
 
-        # Show resolved dates as a preview
-        st.caption("**Resolved periods:**")
-        for p in periods:
-            st.caption(f"• **{p['label']}**: {p['start'].strftime('%b %d, %Y')} → {p['end'].strftime('%b %d, %Y')}")
-
-        # Apples-to-apples confirmation
-        if len(periods) == 2 and compare_to == "Same Period Last Year":
-            p_days  = (periods[1]["end"] - periods[1]["start"]).days + 1
-            c_days  = (periods[0]["end"] - periods[0]["start"]).days + 1
+        # Show resolved dates preview
+        st.caption(f"📅 **{p_label}:** {p_start.strftime('%b %d, %Y')} → {p_end.strftime('%b %d, %Y')}")
+        if comp:
+            p_days = (p_end - p_start).days + 1
+            c_days = (comp[2] - comp[1]).days + 1
+            st.caption(f"📅 **vs. {comp[0]}:** {comp[1].strftime('%b %d, %Y')} → {comp[2].strftime('%b %d, %Y')}")
             if p_days == c_days:
-                st.caption(f"✅ Exact match: both periods are **{p_days} days**")
+                st.caption(f"✅ {p_days}-day range, exact match")
             else:
-                st.caption(f"⚠️ Period lengths differ: {p_days}d vs {c_days}d (e.g. Feb vs Feb in leap year)")
+                st.caption(f"ℹ️ {p_days}d vs {c_days}d")
 
         st.divider()
+        st.subheader("🚫 Excluded Domains")
+        st.caption("Orders from these email domains are excluded (employees, internal).")
 
-        # Generate Report Button
-        can_generate = cin7_user and cin7_key
+        _excluded_cfg = load_config().get("excluded_domains", get_secret("EXCLUDED_DOMAINS", "vivantskincare.com"))
+        excluded_input = st.text_area(
+            "One domain per line",
+            value="\n".join(d.strip() for d in _excluded_cfg.split(",") if d.strip()),
+            height=80,
+            key="excluded_domains_input",
+            help="e.g. vivantskincare.com — any order with a matching customer email is excluded."
+        )
+        if st.button("💾 Save Exclusions", use_container_width=True):
+            domains_csv = ", ".join(
+                d.strip().lower() for d in excluded_input.splitlines() if d.strip())
+            save_config({"excluded_domains": domains_csv})
+            cache_clear_all()
+            st.session_state.report_data = None
+            st.success("Saved — run report to apply.")
+            st.rerun()
 
         # Cache status
         meta = _load_cache_meta()
@@ -1390,13 +1435,15 @@ def main():
             st.markdown("#### Why Orders Were Excluded")
             excl_data = {
                 "Reason": [
-                    "Shopify / Retail channel (B2C, excluded by design)",
+                    "Shopify / Retail channel (B2C)",
+                    "Excluded email domain (employees)",
                     "Outside selected date windows",
                     "$0 total orders",
                     "No company name (mapped to 'Unknown')",
                 ],
                 "Count": [
                     audit['excluded_source'],
+                    audit.get('excluded_domain', 0),
                     audit['excluded_no_period'],
                     audit['excluded_zero_total'],
                     audit['unknown_company'],
@@ -1406,6 +1453,16 @@ def main():
             excl_df['% of Raw'] = excl_df['Count'].apply(
                 lambda x: f"{x/total*100:.1f}%" if total else "0%")
             st.dataframe(excl_df, use_container_width=True, hide_index=True)
+
+            if audit.get('excluded_domain_counts'):
+                st.markdown("#### Excluded by Email Domain")
+                dom_df = pd.DataFrame([
+                    {"Domain": k, "Orders Dropped": v}
+                    for k, v in sorted(audit['excluded_domain_counts'].items(),
+                                       key=lambda x: -x[1])
+                ])
+                st.dataframe(dom_df, use_container_width=True, hide_index=True)
+                st.caption("Manage domains in the sidebar under **🚫 Excluded Domains**.")
 
             # ── Source values that triggered exclusion ────────────────
             if audit['excluded_sources']:
