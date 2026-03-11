@@ -300,7 +300,6 @@ def fetch_orders_fast(username: str, api_key: str,
                       label: str = "") -> list:
     """
     Fetch all orders for a date range using parallel page batching.
-    
     Strategy:
     - Fetch PAGE_BATCH pages simultaneously
     - Stop when any page returns < PAGE_SIZE rows (that's the last page)
@@ -398,10 +397,8 @@ def fetch_cin7_customers(username: str, api_key: str) -> dict:
     Fetch Cin7 Contacts. Returns {COMPANY_UPPER: {rep, type}}.
     Disk-cached with 12h TTL — contacts rarely change.
     """
-    # Check disk cache first
     cached = cache_load_contacts()
     if cached is not None:
-        st.session_state.cin7_customers = cached
         return cached
 
     customers = {}
@@ -440,7 +437,6 @@ def fetch_cin7_customers(username: str, api_key: str) -> dict:
             break
 
     cache_save_contacts(customers)
-    st.session_state.cin7_customers = customers
     return customers
 
 # =============================================================================
@@ -493,8 +489,8 @@ def fetch_hubspot_company_data(api_key: str, tier_property: str = "commission_ti
             after = data.get("paging", {}).get("next", {}).get("after")
             if not after:
                 break
-        except Exception as e:
-            st.warning(f"HubSpot error: {e}")
+        except Exception:
+            # ✅ FIX: removed st.warning() — not safe to call from threads
             break
     return tiers, owners
 
@@ -729,6 +725,10 @@ def run_full_fetch(cin7_user: str, cin7_key: str, hubspot_key: str,
     def _fetch_contacts(user, key):
         return fetch_cin7_customers(user, key)
 
+    # ✅ FIX: collect results into local variables — never touch st.* inside threads
+    fetched_customers = None
+    fetch_warnings    = []
+
     tasks = {}
     with ThreadPoolExecutor(max_workers=8) as ex:
         for args in needs_fetch:
@@ -749,9 +749,15 @@ def run_full_fetch(cin7_user: str, cin7_key: str, hubspot_key: str,
                 elif kind == "hubspot":
                     hs_tiers, hs_owners, hs_lookup = fut.result()
                 elif kind == "contacts":
-                    st.session_state.cin7_customers = fut.result()
+                    fetched_customers = fut.result()   # ✅ store locally, not in st.session_state
             except Exception as err:
-                st.warning(f"Fetch error ({kind}): {err}")
+                fetch_warnings.append(f"Fetch error ({kind}): {err}")  # ✅ store locally
+
+    # ✅ FIX: apply to session_state and show warnings AFTER thread pool exits
+    if fetched_customers is not None:
+        st.session_state.cin7_customers = fetched_customers
+    for w in fetch_warnings:
+        st.warning(w)
 
     # ── Step 4: build DataFrame ───────────────────────────────────────────────
     cin7_staff   = fetch_cin7_staff(cin7_user, cin7_key)
@@ -908,8 +914,6 @@ def same_period_prior_year(start, end):
 def main():
     inject_css()
 
-    # can_generate defined at function scope FIRST — permanent fix so it is
-    # always available to the Generate button regardless of sidebar execution.
     can_generate = False
 
     st.markdown(f"""
@@ -930,7 +934,6 @@ def main():
         cin7_key  = st.text_input("API Key",  value=get_secret("CIN7_API_KEY"),
                                    type="password", key="cin7_key")
 
-        # Overwrite the False set above — always runs before the button
         can_generate = bool(cin7_user and cin7_key)
 
         if cin7_user and cin7_key:
@@ -1066,12 +1069,9 @@ def main():
             save_config({"last_period": selected_period, "last_compare": compare_to})
             st.session_state.periods = periods
 
-            # If we have cached data for all periods, show it immediately
-            # while doing a background freshness check
             has_all_cache = all(cache_has_orders(p["label"]) for p in periods)
 
             if has_all_cache and not auto_fetch:
-                # Show cached version instantly, then refresh
                 quick_orders = []
                 for p in periods:
                     cached = cache_load_orders_any(p["label"])
@@ -1079,7 +1079,6 @@ def main():
                         quick_orders.extend(cached)
 
                 if quick_orders:
-                    # Build and display instantly from cache
                     hs_tiers, hs_owners = cache_load_hubspot()
                     hs_tiers  = hs_tiers  or {}
                     hs_owners = hs_owners or {}
@@ -1097,7 +1096,6 @@ def main():
                         st.session_state.audit       = audit
                         st.session_state.periods     = periods
 
-            # Now do the real fetch (will update if data changed)
             with st.spinner("Refreshing..."):
                 result = run_full_fetch(cin7_user, cin7_key, hubspot_key,
                                         tier_property, periods)
@@ -1107,7 +1105,6 @@ def main():
             st.rerun()
 
         elif auto_fetch:
-            # Build from cache immediately — no spinner, no wait
             quick_orders = []
             for p in periods:
                 cached = cache_load_orders_any(p["label"])
@@ -1361,6 +1358,6 @@ def main():
 
 
 # =============================================================================
-# ENTRY POINT  (unconditional -- Streamlit imports this module)
+# ENTRY POINT
 # =============================================================================
 main()
