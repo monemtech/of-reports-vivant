@@ -43,7 +43,7 @@ PAGE_BATCH  = 2
 
 CIN7_ORDER_FIELDS = (
     "id,company,billingCompany,firstName,lastName,"
-    "email,total,createdDate,modifiedDate,salesPersonId,source"
+    "email,total,createdDate,modifiedDate,orderDate,salesPersonId,source"
 )
 
 BRANDING = {"company_name": "OrderFloz", "primary_color": "#1a5276", "accent_color": "#00d4aa"}
@@ -684,10 +684,12 @@ def aggregate_orders_by_company(orders: list, periods: list,
         sp_id        = order.get("salesPersonId")
         rep_name     = (cin7_staff or {}).get(sp_id, "") if sp_id else ""
         cust_email   = (order.get("email") or "").strip()
-        created_date = order.get("createdDate", "")
+        # Use orderDate for period matching — createdDate is system record date,
+        # not the actual order/invoice date that Cin7 filters by
+        order_date   = order.get("orderDate") or order.get("createdDate", "")
         source       = (order.get("source") or "").strip()
         source_lower = source.lower()
-        period_label = get_period_label(created_date)
+        period_label = get_period_label(order_date)
 
         if "shopify" in source_lower or "retail" in source_lower:
             audit["excluded_source"] += 1
@@ -914,7 +916,7 @@ def run_full_fetch(cin7_user: str, cin7_key: str, hubspot_key: str,
     st.session_state["_debug"] = {
         "total_orders_fetched": len(all_orders),
         "periods": [p["label"] for p in periods],
-        "first_order": all_orders[0] if all_orders else None,
+        "first_order": {k: all_orders[0].get(k) for k in ["id","company","createdDate","orderDate","source","total"]} if all_orders else None,
         "audit_total_raw": audit.get("total_raw", 0),
         "audit_excluded_source": audit.get("excluded_source", 0),
         "audit_excluded_domain": audit.get("excluded_domain", 0),
