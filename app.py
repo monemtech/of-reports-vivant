@@ -1090,8 +1090,8 @@ def export_raw_orders_csv() -> bytes:
             seen.add(oid)
         unique_orders.append(o)
 
-    # Load whitelist for account/tier/rep enrichment
-    wl = load_account_whitelist()
+    # Load whitelist for account/tier/rep enrichment (guard against None)
+    wl = load_account_whitelist() or {}
 
     rows = []
     for o in unique_orders:
