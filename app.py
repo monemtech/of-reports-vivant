@@ -48,6 +48,9 @@ CIN7_ORDER_FIELDS = (
 
 BRANDING = {"company_name": "OrderFloz", "primary_color": "#1a5276", "accent_color": "#00d4aa"}
 
+# Approved account whitelist (committed to repo alongside app.py)
+WHITELIST_FILE = Path("VIVANT_CONTACT_LIST_FOR_HUBSPOT.xlsx")
+
 # =============================================================================
 # CONFIG HELPERS
 # =============================================================================
@@ -79,6 +82,53 @@ def get_excluded_domains() -> set:
     if not raw:
         return set()
     return {d.strip().lower() for d in raw.split(",") if d.strip()}
+
+# =============================================================================
+# ACCOUNT WHITELIST  (loaded from Excel file committed to repo)
+# =============================================================================
+
+@st.cache_data(ttl=3600)
+def load_account_whitelist() -> dict:
+    """
+    Load approved accounts from VIVANT_CONTACT_LIST_FOR_HUBSPOT.xlsx.
+    Returns dict: {COMPANY_UPPER: {tier, rep, type}} for Active accounts only.
+    """
+    if not WHITELIST_FILE.exists():
+        return {}
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(WHITELIST_FILE)
+        ws = wb.active
+        headers = [cell.value for cell in ws[1]]
+
+        def col(name):
+            try: return headers.index(name)
+            except ValueError: return None
+
+        idx_status = col("Active Status")
+        idx_customer = col("Customer")
+        idx_tier = col("Commission Tier")
+        idx_rep = col("Owner Name")
+        idx_rep_init = col("Rep")
+        idx_type = col("Business Type")
+
+        accounts = {}
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if idx_status is not None and row[idx_status] != "Active":
+                continue
+            name = (row[idx_customer] or "").strip().upper()
+            if not name:
+                continue
+            tier = (row[idx_tier] or "").strip().strip("()") if idx_tier is not None else ""
+            rep  = (row[idx_rep] or "").strip() if idx_rep is not None else ""
+            if not rep and idx_rep_init is not None:
+                rep = (row[idx_rep_init] or "").strip()
+            btype = (row[idx_type] or "").strip() if idx_type is not None else ""
+            accounts[name] = {"tier": tier, "rep": rep, "type": btype}
+        return accounts
+    except Exception as e:
+        st.warning(f"Could not load account whitelist: {e}")
+        return {}
 
 # =============================================================================
 # DISK CACHE
@@ -668,6 +718,10 @@ def build_report_dataframe(company_data: dict, hubspot_tiers: dict, periods: lis
     primary_col   = primary_label
     comp_col      = comp_label if comp_label else "Comparison"
 
+    # Load approved account whitelist
+    whitelist = load_account_whitelist()
+    use_whitelist = bool(whitelist)
+
     rows = []
     for company, data in company_data.items():
         primary_sales = data.get(primary_label, 0)
@@ -675,13 +729,23 @@ def build_report_dataframe(company_data: dict, hubspot_tiers: dict, periods: lis
         if primary_sales == 0 and comp_sales == 0:
             continue
 
-        tier      = hubspot_tiers.get(company.upper(), "")
-        cin7_cust = (cin7_customers or {}).get(company.upper(), {})
-        rep       = cin7_cust.get("rep", "") or data.get("rep", "")
+        company_upper = company.upper()
+
+        # Whitelist filter — skip accounts not in the approved list
+        if use_whitelist and company_upper not in whitelist:
+            continue
+
+        # Tier from whitelist only
+        tier  = wl_entry.get("tier", "")
+
+        # Rep from whitelist first, fall back to cin7_customers and HubSpot owners
+        rep = wl_entry.get("rep", "")
+        if not rep:
+            cin7_cust = (cin7_customers or {}).get(company_upper, {})
+            rep = cin7_cust.get("rep", "") or data.get("rep", "")
         if not rep and company_owners and owners_lookup:
-            owner_id = company_owners.get(company.upper(), "")
+            owner_id = company_owners.get(company_upper, "")
             rep      = owners_lookup.get(owner_id, "") if owner_id else ""
-        ctype = cin7_cust.get("type", "")
 
         if comp_sales > 0:
             change_pct = ((primary_sales - comp_sales) / comp_sales) * 100
@@ -696,7 +760,6 @@ def build_report_dataframe(company_data: dict, hubspot_tiers: dict, periods: lis
             comp_col:          comp_sales,
             "$ Change":        primary_sales - comp_sales,
             "% Change":        change_pct,
-            "Type":            ctype,
             "Tier":            tier,
             "Sales Rep":       rep,
             "_order_count":    data.get("order_count", 0),
@@ -811,6 +874,7 @@ def run_full_fetch(cin7_user: str, cin7_key: str, hubspot_key: str,
         cin7_customers=st.session_state.cin7_customers)
 
     # Store raw debug info to session state so it survives st.rerun()
+    whitelist = load_account_whitelist()
     st.session_state["_debug"] = {
         "total_orders_fetched": len(all_orders),
         "periods": [p["label"] for p in periods],
@@ -822,6 +886,7 @@ def run_full_fetch(cin7_user: str, cin7_key: str, hubspot_key: str,
         "audit_zero_total": audit.get("excluded_zero_total", 0),
         "source_values_seen": audit.get("excluded_sources", {}),
         "fetch_warnings": fetch_warnings,
+        "whitelist_loaded": len(whitelist),
     }
 
     return {"df": df, "audit": audit, "hubspot_tiers": hs_tiers, "all_orders": all_orders}
@@ -1237,9 +1302,8 @@ def main():
             | **Prior Year** | Revenue for comparison period |
             | **$ Change** | Dollar difference |
             | **% Change** | Growth / decline % |
-            | **Type** | Account type from Cin7 (6%, 10%, HA) |
-            | **Tier** | Commission tier from HubSpot |
-            | **Sales Rep** | Assigned rep from Cin7 Contacts |
+            | **Tier** | Commission tier (HA, 10%, 6%) |
+            | **Sales Rep** | Assigned rep from approved account list |
             """)
         return
 
@@ -1248,7 +1312,7 @@ def main():
     periods     = st.session_state.get("periods", [])
 
     # ── Filters ───────────────────────────────────────────────────────────────
-    fc1, fc2, fc3, fc4, fc5 = st.columns(5)
+    fc1, fc2, fc3, fc4 = st.columns(4)
     with fc1:
         reps = ["All"] + sorted([r for r in df["Sales Rep"].unique() if r])
         selected_rep = st.selectbox("Sales Rep", reps)
@@ -1257,12 +1321,8 @@ def main():
         has_no_tier = df["Tier"].eq("").any() or df["Tier"].isna().any()
         selected_tier = st.selectbox("Tier", ["All"]+tiers_list+(["(No Tier)"] if has_no_tier else []))
     with fc3:
-        types_list = sorted([t for t in df["Type"].unique() if t]) if "Type" in df.columns else []
-        has_no_type = (df["Type"].eq("").any() or df["Type"].isna().any()) if "Type" in df.columns else False
-        selected_type = st.selectbox("Type", ["All"]+types_list+(["(No Type)"] if has_no_type else []))
-    with fc4:
         min_sales = st.number_input(f"Min {primary_col} ($)", min_value=0, value=0, step=500)
-    with fc5:
+    with fc4:
         sort_options = [
             f"{primary_col} down", f"{primary_col} up",
             f"{comp_col} down", f"{comp_col} up",
@@ -1276,9 +1336,6 @@ def main():
     if selected_rep  != "All": fdf = fdf[fdf["Sales Rep"]==selected_rep]
     if selected_tier == "(No Tier)": fdf = fdf[fdf["Tier"].eq("")|fdf["Tier"].isna()]
     elif selected_tier != "All":     fdf = fdf[fdf["Tier"]==selected_tier]
-    if "Type" in fdf.columns:
-        if selected_type == "(No Type)": fdf = fdf[fdf["Type"].eq("")|fdf["Type"].isna()]
-        elif selected_type != "All":     fdf = fdf[fdf["Type"]==selected_type]
     if min_sales > 0: fdf = fdf[fdf[primary_col]>=min_sales]
 
     sort_map = {
@@ -1327,13 +1384,12 @@ def main():
         st.caption(f"{len(fdf)} accounts")
 
         display_cols = [c for c in ["Account",primary_col,comp_col,"$ Change","% Change",
-                                     "Type","Tier","Sales Rep"] if c in fdf.columns]
+                                     "Tier","Sales Rep"] if c in fdf.columns]
         col_cfg = {
             "Account":   st.column_config.TextColumn("Account", width="medium"),
             primary_col: st.column_config.NumberColumn(primary_col, format="$%.2f", width="small"),
             "$ Change":  st.column_config.NumberColumn("$ Change",  format="$%.2f", width="small"),
             "% Change":  st.column_config.NumberColumn("% Change",  format="%.1f%%", width="small"),
-            "Type":      st.column_config.TextColumn("Type",       width="small"),
             "Tier":      st.column_config.TextColumn("Tier",       width="small"),
             "Sales Rep": st.column_config.TextColumn("Sales Rep",  width="small"),
         }
@@ -1365,7 +1421,7 @@ def main():
     with tab3:
         st.subheader("📤 Export Report")
         export_cols = [c for c in ["Account",primary_col,comp_col,"$ Change","% Change",
-                                    "Type","Tier","Sales Rep"] if c in fdf.columns]
+                                    "Tier","Sales Rep"] if c in fdf.columns]
         export_df = fdf[export_cols].copy()
         ec1,ec2 = st.columns(2)
         with ec1:
@@ -1401,7 +1457,7 @@ def main():
             if "Tier" in df.columns:
                 untiered = df["Tier"].eq("").sum() + df["Tier"].isna().sum()
                 if untiered:
-                    st.warning(f"{untiered} accounts have no HubSpot tier assigned.")
+                    st.warning(f"{untiered} accounts have no tier assigned.")
 
             st.divider()
             st.markdown("#### Exclusion Breakdown")
