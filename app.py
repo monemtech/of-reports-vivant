@@ -132,6 +132,21 @@ def load_account_whitelist() -> dict:
             if not rep or "@" in rep:
                 rep = (raw_init or "").strip()
 
+            # Expand known initials to full names
+            INITIALS_MAP = {
+                "AR":   "Andres Rodriguez",
+                "CM":   "Claudia Mendez",
+                "FT":   "Flavia Trigueros",
+                "JS":   "Jaqueline Steelman",
+                "MK":   "Masha Krivaya",
+                "TP":   "Todd Price",
+                "MG":   "Maryanne Goodman",
+                "RA-MG":"Maryanne Goodman",
+                "AS":   "AS",
+                "DM":   "DM",
+            }
+            rep = INITIALS_MAP.get(rep.upper(), rep)
+
             accounts[name] = {"tier": tier, "rep": rep, "canonical": str(customer).strip()}
 
         return accounts
@@ -873,28 +888,42 @@ def run_full_fetch(cin7_user: str, cin7_key: str, hubspot_key: str,
         else:
             needs_fetch.append((p, s, e, fp))
 
-    # Load any preloaded monthly data that covers the gaps
+    # Load any preloaded monthly caches that cover needed periods
+    # Instead of loading all cached months (which caused over-aggregation),
+    # map each unfetched period to its exact constituent months and load only those.
     if needs_fetch:
-        preloaded = _overlapping_cached_months(periods)
-        if preloaded:
-            all_orders.extend(preloaded)
-            # Remove periods that are now covered by preloaded data
-            covered = set()
-            import calendar as _cal2
-            for p, s, e, fp in needs_fetch:
-                p_start = p["start"]; p_end = p["end"]
-                # Check if all days in period are covered by preloaded orders
-                all_dates = {o.get("orderDate","")[:7] for o in preloaded if o.get("orderDate")}
-                needed_months = set()
-                cur = p_start.replace(day=1)
-                while cur <= p_end:
-                    needed_months.add(cur.strftime("%Y-%m"))
-                    m = cur.month + 1; y = cur.year + (1 if m > 12 else 0); m = m if m <= 12 else 1
-                    cur = cur.replace(year=y, month=m, day=1)
-                if needed_months.issubset(all_dates):
-                    covered.add(p["label"])
-            needs_fetch = [(p, s, e, fp) for p, s, e, fp in needs_fetch
-                           if p["label"] not in covered]
+        import calendar as _cal2
+        still_needs = []
+        for p, s, e, fp in needs_fetch:
+            # Build list of "Mon YYYY" month labels that fall within this period
+            month_orders = []
+            cur = p["start"].replace(day=1)
+            while cur <= p["end"]:
+                mlabel = cur.strftime("%b %Y")
+                cached_month = cache_load_orders_any(mlabel)
+                if cached_month is not None:
+                    # Only include orders whose orderDate falls within this period
+                    for o in cached_month:
+                        raw_date = o.get("orderDate") or o.get("createdDate", "")
+                        try:
+                            od = datetime.strptime(raw_date[:10], "%Y-%m-%d").date()
+                            if p["start"] <= od <= p["end"]:
+                                month_orders.append(o)
+                        except Exception:
+                            pass
+                # Advance to next month
+                nm = cur.month + 1
+                ny = cur.year + (1 if nm > 12 else 0)
+                nm = nm if nm <= 12 else 1
+                cur = cur.replace(year=ny, month=nm, day=1)
+
+            if month_orders:
+                all_orders.extend(month_orders)
+                # Save as a combined cache entry for this period label
+                cache_save_orders(p["label"], month_orders, fp)
+            else:
+                still_needs.append((p, s, e, fp))
+        needs_fetch = still_needs
 
     # ── Step 3: parallel fast-fetch all needed periods + HubSpot + Contacts ──
     hs_tiers  = {}
