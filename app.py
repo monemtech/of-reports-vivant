@@ -1433,7 +1433,7 @@ def main():
             help="Loads every month from Jan of that year to today and caches it. "
                  "Subsequent Generate clicks will be instant."
         )
-        start_preload_year = today_yr - preload_years + 1
+        start_preload_year = today_yr - preload_years
 
         col_pre1, col_pre2 = st.columns(2)
         with col_pre1:
