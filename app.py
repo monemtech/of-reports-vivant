@@ -1109,7 +1109,7 @@ def export_raw_orders_csv() -> bytes:
 
         # Whitelist enrichment
         company  = o.get("company") or o.get("billingCompany") or ""
-        wl_entry = _whitelist_lookup(wl, company)
+        wl_entry = _whitelist_lookup(company.upper(), wl)
         if wl_entry:
             row["account"] = wl_entry.get("canonical", company)
             row["tier"]    = wl_entry.get("tier", "")
