@@ -735,6 +735,9 @@ def build_report_dataframe(company_data: dict, hubspot_tiers: dict, periods: lis
         if use_whitelist and company_upper not in whitelist:
             continue
 
+        # Always define wl_entry (empty dict if no whitelist)
+        wl_entry = whitelist.get(company_upper, {}) if use_whitelist else {}
+
         # Tier from whitelist only
         tier  = wl_entry.get("tier", "")
 
