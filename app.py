@@ -1062,6 +1062,83 @@ def export_to_excel(df: pd.DataFrame) -> bytes:
             ws.column_dimensions[chr(65 + idx)].width = width
     return output.getvalue()
 
+def export_raw_orders_csv() -> bytes:
+    """
+    Load all cached orders and export as CSV, sorted by order date descending.
+    Adds order_date (clean YYYY-MM-DD) and order_year_month (YYYY-MM) for easy sorting/filtering.
+    """
+    meta = _load_cache_meta()
+    all_orders = []
+    for key, entry in meta.items():
+        if not key.startswith("cin7_"):
+            continue
+        cached = cache_load_orders_any(entry.get("label", ""))
+        if cached:
+            all_orders.extend(cached)
+
+    if not all_orders:
+        return b""
+
+    # Deduplicate by order id
+    seen = set()
+    unique_orders = []
+    for o in all_orders:
+        oid = o.get("id")
+        if oid and oid in seen:
+            continue
+        if oid:
+            seen.add(oid)
+        unique_orders.append(o)
+
+    # Load whitelist for account/tier/rep enrichment
+    wl = load_account_whitelist()
+
+    rows = []
+    for o in unique_orders:
+        row = {k: v for k, v in o.items() if not isinstance(v, (dict, list))}
+
+        # Clean date columns
+        raw_date = o.get("orderDate") or o.get("createdDate", "")
+        try:
+            od = datetime.strptime(raw_date[:10], "%Y-%m-%d").date()
+            row["order_date"]       = od.strftime("%Y-%m-%d")
+            row["order_year_month"] = od.strftime("%Y-%m")
+        except:
+            row["order_date"]       = ""
+            row["order_year_month"] = ""
+
+        # Whitelist enrichment
+        company  = o.get("company") or o.get("billingCompany") or ""
+        wl_entry = _whitelist_lookup(wl, company)
+        if wl_entry:
+            row["account"] = wl_entry.get("canonical", company)
+            row["tier"]    = wl_entry.get("tier", "")
+            row["rep"]     = wl_entry.get("rep", "")
+        else:
+            row["account"] = company
+            row["tier"]    = ""
+            row["rep"]     = ""
+
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    if "order_date" in df.columns:
+        df = df.sort_values("order_date", ascending=False)
+
+    priority = [
+        "order_date", "order_year_month",
+        "account", "tier", "rep",
+        "id", "reference", "company", "billingCompany",
+        "firstName", "lastName", "email",
+        "total", "source", "status", "salesPersonId",
+    ]
+    cols = [c for c in priority if c in df.columns]
+    rest = [c for c in df.columns if c not in cols]
+    df   = df[cols + rest]
+
+    return df.to_csv(index=False).encode("utf-8")
+
+
 # =============================================================================
 # CSS
 # =============================================================================
@@ -1329,6 +1406,16 @@ def main():
                 h = (datetime.now()-datetime.fromisoformat(contacts_entry["saved_at"])).total_seconds()/3600
                 parts.append(f"Contacts {h:.0f}h")
             st.caption("💾 " + " · ".join(parts))
+            raw_csv = export_raw_orders_csv()
+            if raw_csv:
+                st.download_button(
+                    "⬇️ Download Raw Cin7 Data",
+                    data=raw_csv,
+                    file_name=f"cin7_raw_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    help="All cached orders, sorted by date — one row per order"
+                )
             if st.button("🗑️ Clear Cache", use_container_width=True):
                 cache_clear_all()
                 st.session_state.report_data = None
