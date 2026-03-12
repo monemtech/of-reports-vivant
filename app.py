@@ -370,7 +370,8 @@ def _fetch_page(username: str, api_key: str, start: str, end: str,
     Filters by orderDate (actual invoice date) not createdDate (system entry date).
     """
     params = {
-        "where": f"orderDate >= '{start}' AND orderDate <= '{end}'",
+        "createdDateFrom": start,
+        "createdDateTo":   end,
         "page":  page,
         "rows":  PAGE_SIZE,
     }
@@ -485,7 +486,8 @@ def probe_cin7_fingerprint(username: str, api_key: str,
             "https://api.cin7.com/api/v1/SalesOrders",
             auth=(username, api_key),
             params={
-                "where":  f"orderDate >= '{start_date}' AND orderDate <= '{end_date}'",
+                "createdDateFrom": start_date,
+                "createdDateTo":   end_date,
                 "rows":   1,
                 "order":  "modifiedDate desc",
                 "fields": "id,modifiedDate",
@@ -685,6 +687,19 @@ def aggregate_orders_by_company(orders: list, periods: list,
         "excluded_sources": {}, "excluded_domain_counts": {}, "sample_excluded": [],
     }
 
+    # Deduplicate by order ID — buffered fetches can return the same order twice
+    seen_ids = set()
+    deduped  = []
+    for o in orders:
+        oid = o.get("id")
+        if oid and oid in seen_ids:
+            continue
+        if oid:
+            seen_ids.add(oid)
+        deduped.append(o)
+    orders = deduped
+    audit["total_raw"] = len(orders)
+
     for order in orders:
         company = (order.get("company") or order.get("billingCompany") or "").strip()
         if not company:
@@ -837,11 +852,17 @@ def run_full_fetch(cin7_user: str, cin7_key: str, hubspot_key: str,
     all_orders = []
 
     # ── Step 1: For each period, decide probe or use CLOSED shortcut ──────────
+    # Fetch ±60 days wider than the period so orders whose createdDate differs
+    # from orderDate are always captured. Period bucketing is done by orderDate.
+    FETCH_BUFFER_DAYS = 60
+
     def _probe_or_skip(p, user, key):
-        s  = p["start"].strftime("%Y-%m-%d")
-        e  = p["end"].strftime("%Y-%m-%d")
-        fp = "CLOSED" if p["end"] < today_dt else probe_cin7_fingerprint(user, key, s, e)
-        return p, s, e, fp
+        s_buf = (p["start"] - timedelta(days=FETCH_BUFFER_DAYS)).strftime("%Y-%m-%d")
+        e_buf = min(p["end"] + timedelta(days=FETCH_BUFFER_DAYS), today_dt).strftime("%Y-%m-%d")
+        s     = p["start"].strftime("%Y-%m-%d")
+        e     = p["end"].strftime("%Y-%m-%d")
+        fp    = "CLOSED" if p["end"] < today_dt else probe_cin7_fingerprint(user, key, s_buf, e_buf)
+        return p, s_buf, e_buf, fp
 
     probed = []
     for p in periods:
@@ -1046,8 +1067,9 @@ def preload_months(cin7_user: str, cin7_key: str,
         start = datetime(y, m, 1).date()
         end   = min(datetime(y, m, ld).date(), today)
         label = datetime(y, m, 1).strftime("%b %Y")
-        s_str = start.strftime("%Y-%m-%d")
-        e_str = end.strftime("%Y-%m-%d")
+        # Fetch ±60 day buffer so orders with lagging createdDate are captured
+        s_str = (start - timedelta(days=60)).strftime("%Y-%m-%d")
+        e_str = min(end + timedelta(days=60), today).strftime("%Y-%m-%d")
 
         pct = i / len(months)
         progress_placeholder.progress(pct, text=f"📦 {label} ({i+1}/{len(months)})…")
