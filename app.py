@@ -699,7 +699,7 @@ def aggregate_orders_by_company(orders: list, periods: list,
             if len(audit["sample_excluded"]) < 10:
                 audit["sample_excluded"].append({"reason": f"source={source}",
                     "company": company, "total": total,
-                    "date": created_date[:10] if created_date else ""})
+                    "date": order_date[:10] if order_date else ""})
             continue
 
         domain = email_domain(cust_email)
@@ -710,7 +710,7 @@ def aggregate_orders_by_company(orders: list, periods: list,
             if len(audit["sample_excluded"]) < 10:
                 audit["sample_excluded"].append({"reason": f"excluded domain ({domain})",
                     "company": company, "email": cust_email, "total": total,
-                    "date": created_date[:10] if created_date else ""})
+                    "date": order_date[:10] if order_date else ""})
             continue
 
         if period_label is None or period_label not in period_labels:
