@@ -367,7 +367,7 @@ def _fetch_page(username: str, api_key: str, start: str, end: str,
             params=params,
             timeout=60,
         )
-        # Store debug info for first page to a file (session_state not safe from threads)
+        # Store debug info for first page
         if page == 1:
             try:
                 with open(".cin7_api_debug.json", "w") as _f:
@@ -379,6 +379,16 @@ def _fetch_page(username: str, api_key: str, start: str, end: str,
                     }, _f)
             except Exception:
                 pass
+        # Retry on 429 rate limit
+        if r.status_code == 429:
+            time.sleep(3)
+            r = requests.get(
+                "https://api.cin7.com/api/v1/SalesOrders",
+                auth=(username, api_key),
+                params=params,
+                timeout=60,
+            )
+        # Retry without fields on 400/422
         if r.status_code in (400, 422) and use_fields:
             params.pop("fields", None)
             r = requests.get(
@@ -398,29 +408,6 @@ def _fetch_page(username: str, api_key: str, start: str, end: str,
                 json.dump({"exception": str(ex)}, _f)
         except Exception:
             pass
-        return [], True
-    try:
-        r = requests.get(
-            "https://api.cin7.com/api/v1/SalesOrders",
-            auth=(username, api_key),
-            params=params,
-            timeout=60,
-        )
-        if r.status_code in (400, 422) and use_fields:
-            # Retry without fields filter
-            params.pop("fields", None)
-            r = requests.get(
-                "https://api.cin7.com/api/v1/SalesOrders",
-                auth=(username, api_key),
-                params=params,
-                timeout=60,
-            )
-        if r.status_code != 200:
-            return [], True
-        orders = r.json() or []
-        hit_end = len(orders) < PAGE_SIZE
-        return orders, hit_end
-    except Exception:
         return [], True
 
 # =============================================================================
@@ -465,7 +452,7 @@ def fetch_orders_fast(username: str, api_key: str,
             break
 
         # Respect Cin7 rate limit: 3 req/sec
-        time.sleep(0.8)
+        time.sleep(1.5)
         batch_start += PAGE_BATCH
 
     return all_orders
@@ -839,7 +826,7 @@ def run_full_fetch(cin7_user: str, cin7_key: str, hubspot_key: str,
     probed = []
     for p in periods:
         probed.append(_probe_or_skip(p, cin7_user, cin7_key))
-        time.sleep(0.4)  # Respect Cin7 3 req/sec rate limit
+        time.sleep(1.5)  # Respect Cin7 3 req/sec rate limit — generous delay
 
     # ── Step 2: cache check ───────────────────────────────────────────────────
     needs_fetch = []
