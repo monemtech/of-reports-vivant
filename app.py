@@ -121,14 +121,56 @@ def load_account_whitelist() -> dict:
                 continue
             tier = (row[idx_tier] or "").strip().strip("()") if idx_tier is not None else ""
             rep  = (row[idx_rep] or "").strip() if idx_rep is not None else ""
-            if not rep and idx_rep_init is not None:
+            # If rep looks like an email, use initials instead
+            if "@" in rep and idx_rep_init is not None:
+                rep = (row[idx_rep_init] or "").strip()
+            elif not rep and idx_rep_init is not None:
                 rep = (row[idx_rep_init] or "").strip()
             btype = (row[idx_type] or "").strip() if idx_type is not None else ""
+            # If Business Type is DIS, add DIS to tier
+            if btype == "DIS":
+                tier = f"DIS / {tier}" if tier else "DIS"
             accounts[name] = {"tier": tier, "rep": rep, "type": btype}
         return accounts
     except Exception as e:
         st.warning(f"Could not load account whitelist: {e}")
         return {}
+
+def _whitelist_lookup(company_upper: str, whitelist: dict) -> dict:
+    """
+    Look up a company in the whitelist with fuzzy matching.
+    Cin7 names often embed region/tier info e.g. '1 (FL) - FLAWLESS BY MELISSA FOX (HA)'
+    Whitelist has clean name e.g. 'FLAWLESS BY MELISSA FOX'
+    Strategy:
+    1. Exact match
+    2. Strip leading region prefix '1 (FL) - ' and trailing tier suffix ' (HA)'
+    3. Check if any whitelist key is contained within the Cin7 name
+    """
+    import re
+    # 1. Exact match
+    if company_upper in whitelist:
+        return whitelist[company_upper]
+
+    # 2. Strip common Cin7 prefixes/suffixes and try again
+    # Remove leading pattern like "1 (FL) - " or "4 (CA) - "
+    cleaned = re.sub(r'^\d+\s*\([A-Z]{2}\)\s*-\s*', '', company_upper).strip()
+    # Remove trailing tier like " (HA)" " (6%)" " (10%)"
+    cleaned = re.sub(r'\s*\((HA|6%|10%)\)\s*$', '', cleaned).strip()
+    if cleaned in whitelist:
+        return whitelist[cleaned]
+
+    # 3. Check if any whitelist key is a substring of the Cin7 name
+    for key, val in whitelist.items():
+        if len(key) >= 6 and key in company_upper:
+            return val
+
+    # 4. Check if cleaned Cin7 name is a substring of any whitelist key
+    if len(cleaned) >= 6:
+        for key, val in whitelist.items():
+            if cleaned in key or key in cleaned:
+                return val
+
+    return {}
 
 # =============================================================================
 # DISK CACHE
@@ -731,12 +773,10 @@ def build_report_dataframe(company_data: dict, hubspot_tiers: dict, periods: lis
 
         company_upper = company.upper()
 
-        # Whitelist filter — skip accounts not in the approved list
-        if use_whitelist and company_upper not in whitelist:
+        # Whitelist filter — skip accounts with no fuzzy match in approved list
+        wl_entry = _whitelist_lookup(company_upper, whitelist) if use_whitelist else {}
+        if use_whitelist and not wl_entry:
             continue
-
-        # Always define wl_entry (empty dict if no whitelist)
-        wl_entry = whitelist.get(company_upper, {}) if use_whitelist else {}
 
         # Tier from whitelist only
         tier  = wl_entry.get("tier", "")
@@ -797,10 +837,9 @@ def run_full_fetch(cin7_user: str, cin7_key: str, hubspot_key: str,
         return p, s, e, fp
 
     probed = []
-    with ThreadPoolExecutor(max_workers=1) as ex:
-        futs = [ex.submit(_probe_or_skip, p, cin7_user, cin7_key) for p in periods]
-        for f in as_completed(futs):
-            probed.append(f.result())
+    for p in periods:
+        probed.append(_probe_or_skip(p, cin7_user, cin7_key))
+        time.sleep(0.4)  # Respect Cin7 3 req/sec rate limit
 
     # ── Step 2: cache check ───────────────────────────────────────────────────
     needs_fetch = []
