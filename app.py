@@ -132,40 +132,39 @@ def load_account_whitelist() -> dict:
             if not rep or "@" in rep:
                 rep = (raw_init or "").strip()
 
-            accounts[name] = {"tier": tier, "rep": rep}
+            accounts[name] = {"tier": tier, "rep": rep, "canonical": str(customer).strip()}
 
         return accounts
     except Exception:
         return {}
 def _whitelist_lookup(company_upper: str, whitelist: dict) -> dict:
     """
-    Look up a company in the whitelist with fuzzy matching.
-    Cin7 names often embed region/tier info e.g. '1 (FL) - FLAWLESS BY MELISSA FOX (HA)'
-    Whitelist has clean name e.g. 'FLAWLESS BY MELISSA FOX'
-    Strategy:
-    1. Exact match
-    2. Strip leading region prefix '1 (FL) - ' and trailing tier suffix ' (HA)'
-    3. Check if any whitelist key is contained within the Cin7 name
+    Fuzzy match a Cin7 company name against the whitelist.
+    Returns entry dict with tier, rep, and canonical (the vetted Customer name).
+    Cin7 names may have prefixes like '1 (FL) - ' or suffixes like ' (HA)'.
     """
     import re
+
+    def _strip(s):
+        s = re.sub(r'^\d+\s*\([A-Z]{2}\)\s*-\s*', '', s).strip()
+        s = re.sub(r'\s*\((HA|6%|10%)\)\s*$', '', s).strip()
+        return s
+
     # 1. Exact match
     if company_upper in whitelist:
         return whitelist[company_upper]
 
-    # 2. Strip common Cin7 prefixes/suffixes and try again
-    # Remove leading pattern like "1 (FL) - " or "4 (CA) - "
-    cleaned = re.sub(r'^\d+\s*\([A-Z]{2}\)\s*-\s*', '', company_upper).strip()
-    # Remove trailing tier like " (HA)" " (6%)" " (10%)"
-    cleaned = re.sub(r'\s*\((HA|6%|10%)\)\s*$', '', cleaned).strip()
+    # 2. Strip Cin7 prefix/suffix and try again
+    cleaned = _strip(company_upper)
     if cleaned in whitelist:
         return whitelist[cleaned]
 
-    # 3. Check if any whitelist key is a substring of the Cin7 name
+    # 3. Whitelist key fully contained in Cin7 name
     for key, val in whitelist.items():
         if len(key) >= 6 and key in company_upper:
             return val
 
-    # 4. Check if cleaned Cin7 name is a substring of any whitelist key
+    # 4. Cleaned Cin7 name contained in whitelist key (or vice versa)
     if len(cleaned) >= 6:
         for key, val in whitelist.items():
             if cleaned in key or key in cleaned:
@@ -787,8 +786,11 @@ def build_report_dataframe(company_data: dict, hubspot_tiers: dict, periods: lis
         else:
             change_pct = 0.0
 
+        # Use the vetted Customer name from whitelist, not Cin7's raw name
+        display_name = wl_entry.get("canonical") or company
+
         rows.append({
-            "Account":         company,
+            "Account":         display_name,
             primary_col:       primary_sales,
             comp_col:          comp_sales,
             "$ Change":        primary_sales - comp_sales,
@@ -831,6 +833,38 @@ def run_full_fetch(cin7_user: str, cin7_key: str, hubspot_key: str,
         probed.append(_probe_or_skip(p, cin7_user, cin7_key))
 
     # ── Step 2: cache check ───────────────────────────────────────────────────
+    # Also pull any preloaded monthly caches that overlap the requested periods
+    # (avoids re-fetching when user preloaded data)
+    import calendar as _cal
+
+    def _overlapping_cached_months(periods_list):
+        """Return orders from any cached month-label that overlaps a period."""
+        meta = _load_cache_meta()
+        loaded_labels = set()
+        extra_orders = []
+        for key, entry in meta.items():
+            if not key.startswith("cin7_"):
+                continue
+            label = entry.get("label", "")
+            if label in loaded_labels:
+                continue
+            # Parse "Mon YYYY" labels (preloaded months)
+            try:
+                month_start = datetime.strptime(label, "%b %Y").date()
+                yr = month_start.year; mo = month_start.month
+                month_end = month_start.replace(day=_cal.monthrange(yr, mo)[1])
+            except ValueError:
+                continue  # Not a monthly label
+            # Check overlap with any requested period
+            for p in periods_list:
+                if month_start <= p["end"] and month_end >= p["start"]:
+                    cached = cache_load_orders_any(label)
+                    if cached:
+                        extra_orders.extend(cached)
+                        loaded_labels.add(label)
+                    break
+        return extra_orders
+
     needs_fetch = []
     for p, s, e, fp in probed:
         cached = cache_load_orders(p["label"], fp)
@@ -838,6 +872,29 @@ def run_full_fetch(cin7_user: str, cin7_key: str, hubspot_key: str,
             all_orders.extend(cached)
         else:
             needs_fetch.append((p, s, e, fp))
+
+    # Load any preloaded monthly data that covers the gaps
+    if needs_fetch:
+        preloaded = _overlapping_cached_months(periods)
+        if preloaded:
+            all_orders.extend(preloaded)
+            # Remove periods that are now covered by preloaded data
+            covered = set()
+            import calendar as _cal2
+            for p, s, e, fp in needs_fetch:
+                p_start = p["start"]; p_end = p["end"]
+                # Check if all days in period are covered by preloaded orders
+                all_dates = {o.get("orderDate","")[:7] for o in preloaded if o.get("orderDate")}
+                needed_months = set()
+                cur = p_start.replace(day=1)
+                while cur <= p_end:
+                    needed_months.add(cur.strftime("%Y-%m"))
+                    m = cur.month + 1; y = cur.year + (1 if m > 12 else 0); m = m if m <= 12 else 1
+                    cur = cur.replace(year=y, month=m, day=1)
+                if needed_months.issubset(all_dates):
+                    covered.add(p["label"])
+            needs_fetch = [(p, s, e, fp) for p, s, e, fp in needs_fetch
+                           if p["label"] not in covered]
 
     # ── Step 3: parallel fast-fetch all needed periods + HubSpot + Contacts ──
     hs_tiers  = {}
@@ -926,6 +983,70 @@ def run_full_fetch(cin7_user: str, cin7_key: str, hubspot_key: str,
     }
 
     return {"df": df, "audit": audit, "hubspot_tiers": hs_tiers, "all_orders": all_orders}
+
+# =============================================================================
+# PRELOAD — BULK FETCH ALL MONTHS IN A DATE RANGE
+# =============================================================================
+
+def preload_months(cin7_user: str, cin7_key: str,
+                   start_year: int, start_month: int,
+                   end_year: int,   end_month: int,
+                   progress_placeholder) -> dict:
+    """
+    Fetch and cache every calendar month between start and end (inclusive).
+    Skips months already cached with a CLOSED fingerprint.
+    Returns summary: {total_months, fetched, skipped, orders_loaded}
+    """
+    import calendar as _cal
+
+    today = datetime.now().date()
+
+    # Build list of (year, month) tuples
+    months = []
+    y, m = start_year, start_month
+    while (y, m) <= (end_year, end_month):
+        months.append((y, m))
+        m += 1
+        if m > 12:
+            m = 1; y += 1
+
+    summary = {"total": len(months), "fetched": 0, "skipped": 0, "orders": 0}
+
+    for i, (y, m) in enumerate(months):
+        ld    = _cal.monthrange(y, m)[1]
+        start = datetime(y, m, 1).date()
+        end   = min(datetime(y, m, ld).date(), today)
+        label = datetime(y, m, 1).strftime("%b %Y")
+        s_str = start.strftime("%Y-%m-%d")
+        e_str = end.strftime("%Y-%m-%d")
+
+        pct = i / len(months)
+        progress_placeholder.progress(pct, text=f"📦 {label} ({i+1}/{len(months)})…")
+
+        # Closed months: use fingerprint "CLOSED" — no probe needed
+        is_closed = end < today
+        fp = "CLOSED" if is_closed else probe_cin7_fingerprint(cin7_user, cin7_key, s_str, e_str)
+
+        # Skip if already cached with matching fingerprint
+        cached = cache_load_orders(label, fp)
+        if cached is not None:
+            summary["skipped"] += 1
+            summary["orders"]  += len(cached)
+            continue
+
+        # Fetch the month
+        orders = fetch_orders_fast(cin7_user, cin7_key, s_str, e_str, label=label)
+        cache_save_orders(label, orders, fp)
+        summary["fetched"] += 1
+        summary["orders"]  += len(orders)
+
+        # Small gap between months (probe already consumed 1 req)
+        if not is_closed:
+            time.sleep(1.0)
+
+    progress_placeholder.progress(1.0, text=f"✅ Done — {summary['orders']:,} orders across {len(months)} months")
+    return summary
+
 
 # =============================================================================
 # EXPORT
@@ -1213,6 +1334,39 @@ def main():
                 st.session_state.report_data = None
                 st.session_state.cin7_customers = {}
                 st.rerun()
+
+        st.divider()
+
+        # ── PRELOAD: bulk-cache all months in a selectable range ─────────────
+        st.subheader("📥 Preload Historical Data")
+        today_yr = datetime.now().year
+        preload_years = st.slider(
+            "Years of history to load",
+            min_value=1, max_value=5, value=2,
+            help="Loads every month from Jan of that year to today and caches it. "
+                 "Subsequent Generate clicks will be instant."
+        )
+        start_preload_year = today_yr - preload_years + 1
+
+        col_pre1, col_pre2 = st.columns(2)
+        with col_pre1:
+            st.caption(f"From: Jan {start_preload_year}")
+        with col_pre2:
+            st.caption(f"To: {datetime.now().strftime('%b %Y')}")
+
+        if st.button("📥 Preload Data", use_container_width=True, disabled=not can_generate):
+            prog = st.progress(0, text="Starting…")
+            summary = preload_months(
+                cin7_user, cin7_key,
+                start_preload_year, 1,
+                datetime.now().year, datetime.now().month,
+                prog
+            )
+            st.success(
+                f"✅ Preload complete — {summary['orders']:,} orders cached "
+                f"({summary['fetched']} months fetched, {summary['skipped']} skipped)"
+            )
+            st.rerun()
 
         st.divider()
 
