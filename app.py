@@ -49,7 +49,7 @@ CIN7_ORDER_FIELDS = (
 BRANDING = {"company_name": "OrderFloz", "primary_color": "#1a5276", "accent_color": "#00d4aa"}
 
 # Approved account whitelist (committed to repo alongside app.py)
-WHITELIST_FILE = Path("VIVANT_CONTACT_LIST_FOR_HUBSPOT.xlsx")
+WHITELIST_FILE = Path("VIVANT CONTACT LIST FOR HUBSPOT.xlsx")
 
 # =============================================================================
 # CONFIG HELPERS
@@ -90,13 +90,14 @@ def get_excluded_domains() -> set:
 @st.cache_data(ttl=3600)
 def load_account_whitelist() -> dict:
     """
-    Load approved accounts from VIVANT_CONTACT_LIST_FOR_HUBSPOT.xlsx.
-    Returns dict: {COMPANY_UPPER: {tier, rep, type}} for Active accounts only.
+    Load Active accounts from Excel. Key = Customer name (upper).
+    Fields stored: tier (stripped of parens), rep (Owner Name, fallback to Rep initials).
+    No st.* calls inside cached functions.
     """
     if not WHITELIST_FILE.exists():
         return {}
     try:
-        import openpyxl
+        import openpyxl, re as _re
         wb = openpyxl.load_workbook(WHITELIST_FILE)
         ws = wb.active
         headers = [cell.value for cell in ws[1]]
@@ -105,37 +106,37 @@ def load_account_whitelist() -> dict:
             try: return headers.index(name)
             except ValueError: return None
 
-        idx_status = col("Active Status")
+        idx_status   = col("Active Status")
         idx_customer = col("Customer")
-        idx_tier = col("Commission Tier")
-        idx_rep = col("Owner Name")
+        idx_tier     = col("Commission Tier")
+        idx_rep      = col("Owner Name")
         idx_rep_init = col("Rep")
-        idx_type = col("Business Type")
 
         accounts = {}
         for row in ws.iter_rows(min_row=2, values_only=True):
             if idx_status is not None and row[idx_status] != "Active":
                 continue
-            name = (row[idx_customer] or "").strip().upper()
+            customer = (row[idx_customer] or "") if idx_customer is not None else ""
+            name = str(customer).strip().upper()
             if not name:
                 continue
-            tier = (row[idx_tier] or "").strip().strip("()") if idx_tier is not None else ""
-            rep  = (row[idx_rep] or "").strip() if idx_rep is not None else ""
-            # If rep looks like an email, use initials instead
-            if "@" in rep and idx_rep_init is not None:
-                rep = (row[idx_rep_init] or "").strip()
-            elif not rep and idx_rep_init is not None:
-                rep = (row[idx_rep_init] or "").strip()
-            btype = (row[idx_type] or "").strip() if idx_type is not None else ""
-            # If Business Type is DIS, add DIS to tier
-            if btype == "DIS":
-                tier = f"DIS / {tier}" if tier else "DIS"
-            accounts[name] = {"tier": tier, "rep": rep, "type": btype}
-        return accounts
-    except Exception as e:
-        st.warning(f"Could not load account whitelist: {e}")
-        return {}
 
+            # Tier: strip surrounding parens — (HA) -> HA, (10%) -> 10%
+            raw_tier = row[idx_tier] if idx_tier is not None else None
+            tier = _re.sub(r"^\(|\)$", "", str(raw_tier).strip()).strip() if raw_tier else ""
+
+            # Rep: use Owner Name; fall back to Rep initials if blank or is an email
+            raw_owner = row[idx_rep]      if idx_rep      is not None else None
+            raw_init  = row[idx_rep_init] if idx_rep_init is not None else None
+            rep = (raw_owner or "").strip()
+            if not rep or "@" in rep:
+                rep = (raw_init or "").strip()
+
+            accounts[name] = {"tier": tier, "rep": rep}
+
+        return accounts
+    except Exception:
+        return {}
 def _whitelist_lookup(company_upper: str, whitelist: dict) -> dict:
     """
     Look up a company in the whitelist with fuzzy matching.
@@ -847,6 +848,24 @@ def run_full_fetch(cin7_user: str, cin7_key: str, hubspot_key: str,
         cache_save_orders(p["label"], orders, fp)
         return orders
 
+    # ✅ FIX: collect results into local variables — never touch st.* inside threads
+    fetched_customers = None
+    fetch_warnings    = []
+
+    # ── Cin7 periods fetched SEQUENTIALLY to respect 3 req/sec rate limit ────
+    for args in needs_fetch:
+        try:
+            orders = _fetch_period(*args, cin7_user, cin7_key)
+            all_orders.extend(orders)
+        except Exception as err:
+            fetch_warnings.append(f"Fetch error (cin7): {err}")
+        time.sleep(2)  # Gap between periods to avoid rate limiting
+
+    # ── HubSpot + Contacts in parallel (different API, no Cin7 rate limit) ───
+    hs_tiers  = {}
+    hs_owners = {}
+    hs_lookup = {}
+
     def _fetch_hs(api_key, tier_prop):
         t, o = cache_load_hubspot()
         if t is not None:
@@ -860,33 +879,21 @@ def run_full_fetch(cin7_user: str, cin7_key: str, hubspot_key: str,
     def _fetch_contacts(user, key):
         return fetch_cin7_customers(user, key)
 
-    # ✅ FIX: collect results into local variables — never touch st.* inside threads
-    fetched_customers = None
-    fetch_warnings    = []
-
     tasks = {}
     with ThreadPoolExecutor(max_workers=2) as ex:
-        for args in needs_fetch:
-            fut = ex.submit(_fetch_period, *args, cin7_user, cin7_key)
-            tasks[fut] = "cin7"
         if hubspot_key:
-            hsfut = ex.submit(_fetch_hs, hubspot_key, tier_property)
-            tasks[hsfut] = "hubspot"
-        cust_fut = ex.submit(_fetch_contacts, cin7_user, cin7_key)
-        tasks[cust_fut] = "contacts"
+            tasks[ex.submit(_fetch_hs, hubspot_key, tier_property)] = "hubspot"
+        tasks[ex.submit(_fetch_contacts, cin7_user, cin7_key)] = "contacts"
 
         for fut in as_completed(tasks):
             kind = tasks[fut]
             try:
-                if kind == "cin7":
-                    orders = fut.result()
-                    all_orders.extend(orders)
-                elif kind == "hubspot":
+                if kind == "hubspot":
                     hs_tiers, hs_owners, hs_lookup = fut.result()
                 elif kind == "contacts":
-                    fetched_customers = fut.result()   # ✅ store locally, not in st.session_state
+                    fetched_customers = fut.result()
             except Exception as err:
-                fetch_warnings.append(f"Fetch error ({kind}): {err}")  # ✅ store locally
+                fetch_warnings.append(f"Fetch error ({kind}): {err}")
 
     # ✅ FIX: apply to session_state and show warnings AFTER thread pool exits
     if fetched_customers is not None:
