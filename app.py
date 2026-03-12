@@ -39,7 +39,7 @@ ORDERS_TTL_MINUTES = 15      # Open periods: re-check fingerprint every 15 min
 # Cin7 limits: 500 rows/page is the max — use it
 PAGE_SIZE   = 250
 # Cin7 rate limit: 3 req/sec — keep batch small
-PAGE_BATCH  = 2
+PAGE_BATCH  = 3
 
 CIN7_ORDER_FIELDS = (
     "id,company,billingCompany,firstName,lastName,"
@@ -452,8 +452,8 @@ def fetch_orders_fast(username: str, api_key: str,
         if done:
             break
 
-        # Respect Cin7 rate limit: 3 req/sec
-        time.sleep(1.5)
+        # Respect Cin7 rate limit: 3 req/sec (3 pages/batch, 1s gap = ~3 req/s max)
+        time.sleep(1.0)
         batch_start += PAGE_BATCH
 
     return all_orders
@@ -829,7 +829,6 @@ def run_full_fetch(cin7_user: str, cin7_key: str, hubspot_key: str,
     probed = []
     for p in periods:
         probed.append(_probe_or_skip(p, cin7_user, cin7_key))
-        time.sleep(1.5)  # Respect Cin7 3 req/sec rate limit — generous delay
 
     # ── Step 2: cache check ───────────────────────────────────────────────────
     needs_fetch = []
@@ -861,7 +860,6 @@ def run_full_fetch(cin7_user: str, cin7_key: str, hubspot_key: str,
             all_orders.extend(orders)
         except Exception as err:
             fetch_warnings.append(f"Fetch error (cin7): {err}")
-        time.sleep(2)  # Gap between periods to avoid rate limiting
 
     # ── HubSpot + Contacts in parallel (different API, no Cin7 rate limit) ───
     hs_tiers  = {}
