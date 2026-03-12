@@ -366,10 +366,11 @@ _init_session()
 def _fetch_page(username: str, api_key: str, start: str, end: str,
                 page: int, use_fields: bool = True):
     """Fetch a single page. Returns (orders_list, hit_end).
-    hit_end=True means this was the last page."""
+    hit_end=True means this was the last page.
+    Filters by orderDate (actual invoice date) not createdDate (system entry date).
+    """
     params = {
-        "createdDateFrom": start,
-        "createdDateTo":   end,
+        "where": f"orderDate >= '{start}' AND orderDate <= '{end}'",
         "page":  page,
         "rows":  PAGE_SIZE,
     }
@@ -484,8 +485,7 @@ def probe_cin7_fingerprint(username: str, api_key: str,
             "https://api.cin7.com/api/v1/SalesOrders",
             auth=(username, api_key),
             params={
-                "createdDateFrom": start_date,
-                "createdDateTo":   end_date,
+                "where":  f"orderDate >= '{start_date}' AND orderDate <= '{end_date}'",
                 "rows":   1,
                 "order":  "modifiedDate desc",
                 "fields": "id,modifiedDate",
