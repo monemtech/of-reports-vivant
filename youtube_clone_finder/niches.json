@@ -1,0 +1,61 @@
+{
+  "finance": {
+    "label": "Finance & Investing",
+    "rpm_low": 15.0,
+    "rpm_high": 32.0,
+    "notes": "Highest-RPM niche on YouTube. Advertisers: brokerages, credit cards, fintech. Viewers are close to purchase decisions.",
+    "seed_queries": [
+      "best credit cards 2026",
+      "how to invest for beginners",
+      "passive income ideas",
+      "make money with AI",
+      "stock market explained",
+      "dividend investing strategy",
+      "side hustles that actually work"
+    ]
+  },
+  "ai_tools": {
+    "label": "AI & Tech Tools",
+    "rpm_low": 10.0,
+    "rpm_high": 25.0,
+    "notes": "Fastest-growing faceless category in 2026. Demand for 'how to use X' content outpaces creator supply.",
+    "seed_queries": [
+      "best AI tools 2026",
+      "how to use ChatGPT for business",
+      "AI video generator tutorial",
+      "AI agents explained",
+      "AI news this week",
+      "automate your business with AI",
+      "AI side hustle"
+    ]
+  },
+  "motivation": {
+    "label": "Motivation / Stoicism / History",
+    "rpm_low": 5.0,
+    "rpm_high": 12.0,
+    "notes": "Cheap to produce: AI voiceover + cinematic AI b-roll. Evergreen, low research cost, strong watch time.",
+    "seed_queries": [
+      "stoicism daily routine",
+      "marcus aurelius wisdom",
+      "discipline motivation speech",
+      "history documentary ancient",
+      "greatest speeches in history",
+      "morning motivation stoic",
+      "life lessons from history"
+    ]
+  },
+  "kids_rhymes": {
+    "label": "Kids Nursery Rhymes",
+    "rpm_low": 0.5,
+    "rpm_high": 2.0,
+    "notes": "WARNING: 'Made for Kids' (COPPA) disables personalized ads and comments, so RPM is very low. This is a pure volume game (top channels earn on hundreds of millions of views). YouTube actively demonetizes low-quality mass-produced AI kids content — quality bar is HIGH. Highest-risk niche of the four.",
+    "seed_queries": [
+      "nursery rhymes for toddlers",
+      "kids songs compilation",
+      "baby learning songs",
+      "wheels on the bus",
+      "abc song for children",
+      "bedtime songs for kids"
+    ]
+  }
+}
