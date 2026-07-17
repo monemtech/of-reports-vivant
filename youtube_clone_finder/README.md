@@ -1,4 +1,24 @@
-# YouTube Clone Finder
+# YouTube Channel Factory
+
+A full pipeline for producing faceless YouTube channels with AI — the same
+deliverables the "$3,795 YouTube automation" gigs sell, built honestly:
+
+| Step | Tool | Deliverable |
+|---|---|---|
+| 1. Niche research | `clone_finder.py` | Ranked report of popular videos whose format is worth remaking, with revenue math |
+| 2. Channel setup | `producer.py --mode channel` | Name options, positioning, banner/logo briefs, 30-video calendar, monetization plan |
+| 3. Scriptwriting + SEO | `producer.py --topic ...` | Hook-based script, 3 titles, description, tags, CTR thumbnail brief, Invideo prompt |
+| 4. Video render | Invideo AI / Veo (+ human review) | The finished video |
+| 5. Upload & scheduling | `uploader.py` | Scheduled publish with metadata + thumbnail |
+| 6. The offer | `SERVICE_OFFER.md` | Tiered pricing, unit economics, positioning rules for selling this as a service |
+
+`producer.py` needs a Claude API key (`ANTHROPIC_API_KEY`); `clone_finder.py`
+and `uploader.py` need free Google API credentials (setup steps in each file).
+Install everything with `pip install -r requirements.txt`.
+
+---
+
+## Step 1: Clone Finder
 
 Finds popular, recently-published YouTube videos whose **format** you can
 remake with AI tools, ranks them by clone-ability, and shows the revenue math
