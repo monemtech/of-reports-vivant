@@ -72,8 +72,30 @@ PACKAGE_SCHEMA = {
             "description": "One-paragraph production brief for an AI video "
             "generator: visual style, pacing, voiceover tone, b-roll guidance",
         },
+        "image_plan": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "section": {"type": "string", "description": "Which part of the script this covers"},
+                    "search_query": {
+                        "type": "string",
+                        "description": "Stock-photo search query. Brand-safe: "
+                        "generic concepts only, no brand names, no competitor "
+                        "products, no identifiable individuals",
+                    },
+                    "placement": {"type": "string", "description": "How/where the image is used on screen"},
+                },
+                "required": ["section", "search_query", "placement"],
+                "additionalProperties": False,
+            },
+            "description": "5-8 stock image searches covering the script's sections plus one for the thumbnail",
+        },
     },
-    "required": ["script", "titles", "description", "tags", "thumbnail_brief", "invideo_prompt"],
+    "required": [
+        "script", "titles", "description", "tags", "thumbnail_brief",
+        "invideo_prompt", "image_plan",
+    ],
     "additionalProperties": False,
 }
 
@@ -184,6 +206,7 @@ def write_package(result: dict, topic: str, out_root: Path) -> Path:
         encoding="utf-8",
     )
     (out / "invideo_prompt.txt").write_text(result["invideo_prompt"], encoding="utf-8")
+    (out / "image_plan.json").write_text(json.dumps(result["image_plan"], indent=2), encoding="utf-8")
     return out
 
 

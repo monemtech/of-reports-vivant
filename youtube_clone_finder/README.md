@@ -8,9 +8,17 @@ deliverables the "$3,795 YouTube automation" gigs sell, built honestly:
 | 1. Niche research | `clone_finder.py` | Ranked report of popular videos whose format is worth remaking, with revenue math |
 | 2. Channel setup | `producer.py --mode channel` | Name options, positioning, banner/logo briefs, 30-video calendar, monetization plan |
 | 3. Scriptwriting + SEO | `producer.py --topic ...` | Hook-based script, 3 titles, description, tags, CTR thumbnail brief, Invideo prompt |
-| 4. Video render | Invideo AI / Veo (+ human review) | The finished video |
-| 5. Upload & scheduling | `uploader.py` | Scheduled publish with metadata + thumbnail |
-| 6. The offer | `SERVICE_OFFER.md` | Tiered pricing, unit economics, positioning rules for selling this as a service |
+| 4. Stock images | `stock_images.py` | Brand-safe Depositphotos images per script section: previews + picks sheet, then one-command licensing |
+| 5. Video render | Invideo AI / Veo (+ human review) | The finished video |
+| 6. Upload & scheduling | `uploader.py` | Scheduled publish with metadata + thumbnail |
+| 7. The offer | `SERVICE_OFFER.md` | Tiered pricing, unit economics, positioning rules for selling this as a service |
+
+Every video package includes an `image_plan.json` (5–8 brand-safe search
+queries mapped to script sections); `stock_images.py --package <folder>`
+turns it into reviewed previews and licensed full-res files using your
+Depositphotos account (`DP_API_KEY`, plus `DP_USERNAME`/`DP_PASSWORD` for
+licensing — Depositphotos issues API keys on request via their
+[API suite page](https://depositphotos.com/api-suite.html)).
 
 `producer.py` needs a Claude API key (`ANTHROPIC_API_KEY`); `clone_finder.py`
 and `uploader.py` need free Google API credentials (setup steps in each file).
